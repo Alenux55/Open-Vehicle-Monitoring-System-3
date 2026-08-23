@@ -378,7 +378,7 @@ Boot::Boot()
   m_resetreason = esp_reset_reason(); // Note: necessary to link reset_reason module
 
   memset(&ovms_diag_live, 0, sizeof(ovms_diag_live));
-  ovms_diag_live.version = 3;
+  ovms_diag_live.version = 4;
 
   if (cpu0 == POWERON_RESET)
     {

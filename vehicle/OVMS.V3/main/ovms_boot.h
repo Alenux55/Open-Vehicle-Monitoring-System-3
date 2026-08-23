@@ -111,6 +111,46 @@ enum ovms_diag_vfs_owner_result_t : uint32_t
   OVMS_DIAG_VFS_OWNER_FAILED,
   };
 
+enum ovms_diag_vfs_lifecycle_stage_t : uint32_t
+  {
+  OVMS_DIAG_VFS_LIFECYCLE_OPEN_BASELINE = 0,
+  OVMS_DIAG_VFS_LIFECYCLE_QUEUES_READY,
+  OVMS_DIAG_VFS_LIFECYCLE_TASK_READY,
+  OVMS_DIAG_VFS_LIFECYCLE_FOPEN_READY,
+  OVMS_DIAG_VFS_LIFECYCLE_OWNER_READY,
+  OVMS_DIAG_VFS_LIFECYCLE_FULLY_OPEN,
+  OVMS_DIAG_VFS_LIFECYCLE_PRE_CLOSE,
+  OVMS_DIAG_VFS_LIFECYCLE_POST_CLOSE_FREE,
+  OVMS_DIAG_VFS_LIFECYCLE_POST_STOP,
+  OVMS_DIAG_VFS_LIFECYCLE_DESTRUCTION,
+  OVMS_DIAG_VFS_LIFECYCLE_COUNT,
+  };
+
+enum ovms_diag_vfs_sync_state_t : uint32_t
+  {
+  OVMS_DIAG_VFS_SYNC_DIRTY = 1 << 0,
+  OVMS_DIAG_VFS_SYNC_PERIODIC = 1 << 1,
+  OVMS_DIAG_VFS_SYNC_DUE = 1 << 2,
+  OVMS_DIAG_VFS_SYNC_RUNNING = 1 << 3,
+  };
+
+enum ovms_diag_vfs_write_error_t : uint32_t
+  {
+  OVMS_DIAG_VFS_WRITE_SHORT = 1 << 0,
+  OVMS_DIAG_VFS_WRITE_ERRNO = 1 << 1,
+  OVMS_DIAG_VFS_WRITE_FERROR = 1 << 2,
+  OVMS_DIAG_VFS_WRITE_STORAGE = 1 << 3,
+  };
+
+typedef struct
+  {
+  // sequence is published last and identifies the open/close cycle.
+  uint32_t sequence;
+  uint32_t monotonic_ms;
+  uint32_t dma_free;
+  uint32_t dma_largest;
+  } ovms_diag_vfs_heap_stage_t;
+
 typedef struct
   {
   // Even guard values identify stable snapshots; odd means a writer owns the
@@ -186,6 +226,34 @@ typedef struct
   uint32_t vfs_owner_after_largest;
   uint32_t vfs_owner_result;
 
+  uint32_t vfs_lifecycle_sequence;
+  uint32_t vfs_lifecycle_stage;
+  ovms_diag_vfs_heap_stage_t vfs_lifecycle[OVMS_DIAG_VFS_LIFECYCLE_COUNT];
+
+  uint32_t vfs_slow_write_threshold_us;
+  uint32_t vfs_slow_write_sequence;
+  uint32_t vfs_slow_write_requested;
+  uint32_t vfs_slow_write_accepted;
+  uint32_t vfs_slow_write_file_offset;
+  uint32_t vfs_slow_write_cluster_offset;
+  uint32_t vfs_slow_write_batch_used;
+  uint32_t vfs_slow_write_batch_capacity;
+  uint32_t vfs_slow_write_elapsed_us;
+  uint32_t vfs_slow_write_sync_due_ms;
+  uint32_t vfs_slow_write_sync_state;
+  uint32_t vfs_slow_write_primary_queued;
+  uint32_t vfs_slow_write_overflow_queued;
+  uint32_t vfs_slow_write_error_state;
+  int32_t vfs_slow_write_errno;
+  int32_t vfs_slow_write_ferror;
+
+  uint32_t vfs_fflush_last_us;
+  uint32_t vfs_fflush_max_us;
+  int32_t vfs_fflush_result;
+  uint32_t vfs_fsync_last_us;
+  uint32_t vfs_fsync_max_us;
+  int32_t vfs_fsync_result;
+
   uint32_t alloc_failure_count;
   ovms_diag_alloc_entry_t alloc_failure_first;
   ovms_diag_alloc_entry_t alloc_failure_latest;
@@ -205,7 +273,9 @@ typedef struct
 
 static_assert(sizeof(ovms_diag_alloc_entry_t) == 44,
   "allocation diagnostic entry footprint changed");
-static_assert(sizeof(ovms_diag_state_t) == 376,
+static_assert(sizeof(ovms_diag_vfs_heap_stage_t) == 16,
+  "VFS lifecycle heap stage footprint changed");
+static_assert(sizeof(ovms_diag_state_t) == 632,
   "diagnostic state footprint changed; review permanent DRAM/RTC cost");
 
 extern ovms_diag_state_t ovms_diag_live;

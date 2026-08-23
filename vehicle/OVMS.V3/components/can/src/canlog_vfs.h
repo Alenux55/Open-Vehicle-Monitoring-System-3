@@ -182,6 +182,7 @@ class canlog_vfs_conn: public canlogconnection
     uint32_t            m_sync_errors;
     uint64_t            m_sync_time;
     bool                m_dirty;
+    std::atomic<bool>    m_sync_in_progress;
     OvmsMutex           m_stats_mutex;
   };
 
@@ -241,6 +242,8 @@ class canlog_vfs : public canlog
     std::string         m_path;
     canlog_vfs_conn*    m_vfs_conn;
     std::atomic<int>    m_syncperiod;
+    std::atomic<size_t> m_batch_capacity_config;
+    std::atomic<uint32_t> m_sync_deadline_ms;
     std::atomic<int>    m_storage_error_reason;
     std::atomic<bool>   m_accepting;
     std::atomic<uint32_t> m_producers;
@@ -252,6 +255,7 @@ class canlog_vfs : public canlog
     size_t              m_overflow_head;
     size_t              m_overflow_tail;
     size_t              m_overflow_count;
+    std::atomic<size_t> m_overflow_occupancy;
     size_t              m_overflow_highwater;
     bool                m_spill_active;
     int64_t             m_spill_started;
