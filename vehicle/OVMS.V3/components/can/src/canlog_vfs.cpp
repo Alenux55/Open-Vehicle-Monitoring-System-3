@@ -2059,7 +2059,9 @@ std::string canlog_vfs::GetStats()
     << " VfsBuffer:" << (m_vfs_conn ? m_vfs_conn->m_stdio_buffer_size : 0)
     << " BufferSet:" << (m_vfs_conn && m_vfs_conn->m_stdio_buffer_set ? 1 : 0)
     << " StdioMode:unbuffered"
+    << " BatchConfigured:" << m_batch_capacity_config.load()
     << " BatchSize:" << (m_vfs_conn ? m_vfs_conn->m_batch_capacity : 0)
+    << " BatchLimit:" << (m_vfs_conn ? m_vfs_conn->m_batch_limit.load() : 0)
     << " ClusterAlign:" << (m_vfs_conn ? m_vfs_conn->m_cluster_size : 0)
     << " BatchUsed:" << (m_vfs_conn ? m_vfs_conn->m_batch_used.load() : 0)
     << " DirectFormat:" << (m_vfs_conn && m_vfs_conn->m_format_buffer ? 1 : 0);
@@ -2151,6 +2153,41 @@ std::string canlog_vfs::GetStats()
     << " WriteInProgressMs:" << write_in_progress_ms
     << " WriteCurrentRequested:" << write_current_requested;
   result.append(writestats.str());
+
+  std::ostringstream diagstats;
+  diagstats << "\n  SlowWriteThresholdUs:"
+    << OvmsDiagLoad(&ovms_diag_live.vfs_slow_write_threshold_us)
+    << " SlowWriteSequence:"
+    << OvmsDiagLoad(&ovms_diag_live.vfs_slow_write_sequence)
+    << " SlowWriteRequested:"
+    << OvmsDiagLoad(&ovms_diag_live.vfs_slow_write_requested)
+    << " SlowWriteAccepted:"
+    << OvmsDiagLoad(&ovms_diag_live.vfs_slow_write_accepted)
+    << " SlowWriteOffset:"
+    << OvmsDiagLoad(&ovms_diag_live.vfs_slow_write_file_offset)
+    << " SlowWriteClusterOffset:"
+    << OvmsDiagLoad(&ovms_diag_live.vfs_slow_write_cluster_offset)
+    << " SlowWriteBatch:"
+    << OvmsDiagLoad(&ovms_diag_live.vfs_slow_write_batch_used) << "/"
+    << OvmsDiagLoad(&ovms_diag_live.vfs_slow_write_batch_capacity)
+    << " SlowWriteElapsedUs:"
+    << OvmsDiagLoad(&ovms_diag_live.vfs_slow_write_elapsed_us)
+    << " SlowWriteSyncDueMs:"
+    << OvmsDiagLoad(&ovms_diag_live.vfs_slow_write_sync_due_ms)
+    << " SlowWriteSyncState:"
+    << OvmsDiagLoad(&ovms_diag_live.vfs_slow_write_sync_state)
+    << " SlowWriteQueues:"
+    << OvmsDiagLoad(&ovms_diag_live.vfs_slow_write_primary_queued) << "/"
+    << OvmsDiagLoad(&ovms_diag_live.vfs_slow_write_overflow_queued)
+    << " SlowWriteError:"
+    << OvmsDiagLoad(&ovms_diag_live.vfs_slow_write_error_state)
+    << "\n  FFlushLastUs:" << OvmsDiagLoad(&ovms_diag_live.vfs_fflush_last_us)
+    << " FFlushMaxUs:" << OvmsDiagLoad(&ovms_diag_live.vfs_fflush_max_us)
+    << " FFlushResult:" << OvmsDiagLoad(&ovms_diag_live.vfs_fflush_result)
+    << " FSyncLastUs:" << OvmsDiagLoad(&ovms_diag_live.vfs_fsync_last_us)
+    << " FSyncMaxUs:" << OvmsDiagLoad(&ovms_diag_live.vfs_fsync_max_us)
+    << " FSyncResult:" << OvmsDiagLoad(&ovms_diag_live.vfs_fsync_result);
+  result.append(diagstats.str());
 
   return result;
   }
