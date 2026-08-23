@@ -164,6 +164,21 @@ static void can_log_health_line(OvmsWriter* writer, const char* format, ...)
   writer->write(line, output);
   }
 
+static const char* const can_log_vfs_lifecycle_names[
+  OVMS_DIAG_VFS_LIFECYCLE_COUNT] =
+  {
+  "open_baseline",
+  "queues_ready",
+  "task_ready",
+  "fopen_ready",
+  "owner_ready",
+  "fully_open",
+  "pre_close",
+  "post_close_free",
+  "post_stop",
+  "destruction",
+  };
+
 void can_log_heap(int verbosity, OvmsWriter* writer, OvmsCommand* cmd, int argc, const char* const* argv)
   {
   // Sample everything before writing so console output cannot affect the
@@ -295,6 +310,46 @@ void can_log_health(int verbosity, OvmsWriter* writer, OvmsCommand* cmd, int arg
     OvmsDiagLoad(&ovms_diag_live.vfs_owner_before_largest),
     OvmsDiagLoad(&ovms_diag_live.vfs_owner_after_free),
     OvmsDiagLoad(&ovms_diag_live.vfs_owner_after_largest));
+  can_log_health_line(writer,
+    "vfs_lifecycle open_seq:%u stage:%u\n",
+    OvmsDiagLoad(&ovms_diag_live.vfs_lifecycle_sequence),
+    OvmsDiagLoad(&ovms_diag_live.vfs_lifecycle_stage));
+  for (size_t i = 0; i < OVMS_DIAG_VFS_LIFECYCLE_COUNT; ++i)
+    {
+    const ovms_diag_vfs_heap_stage_t& stage = ovms_diag_live.vfs_lifecycle[i];
+    can_log_health_line(writer,
+      "vfs_heap stage:%s seq:%u ms:%u dma_free:%u dma_largest:%u\n",
+      can_log_vfs_lifecycle_names[i],
+      __atomic_load_n(&stage.sequence, __ATOMIC_ACQUIRE),
+      OvmsDiagLoad(&stage.monotonic_ms), OvmsDiagLoad(&stage.dma_free),
+      OvmsDiagLoad(&stage.dma_largest));
+    }
+  can_log_health_line(writer,
+    "slow_write threshold_us:%u seq:%u requested:%u accepted:%u file_offset:%u cluster_offset:%u batch_used:%u batch_capacity:%u elapsed_us:%u sync_due_ms:%u sync_state:%u primary:%u overflow:%u error:%u errno:%d ferror:%d\n",
+    OvmsDiagLoad(&ovms_diag_live.vfs_slow_write_threshold_us),
+    __atomic_load_n(&ovms_diag_live.vfs_slow_write_sequence, __ATOMIC_ACQUIRE),
+    OvmsDiagLoad(&ovms_diag_live.vfs_slow_write_requested),
+    OvmsDiagLoad(&ovms_diag_live.vfs_slow_write_accepted),
+    OvmsDiagLoad(&ovms_diag_live.vfs_slow_write_file_offset),
+    OvmsDiagLoad(&ovms_diag_live.vfs_slow_write_cluster_offset),
+    OvmsDiagLoad(&ovms_diag_live.vfs_slow_write_batch_used),
+    OvmsDiagLoad(&ovms_diag_live.vfs_slow_write_batch_capacity),
+    OvmsDiagLoad(&ovms_diag_live.vfs_slow_write_elapsed_us),
+    OvmsDiagLoad(&ovms_diag_live.vfs_slow_write_sync_due_ms),
+    OvmsDiagLoad(&ovms_diag_live.vfs_slow_write_sync_state),
+    OvmsDiagLoad(&ovms_diag_live.vfs_slow_write_primary_queued),
+    OvmsDiagLoad(&ovms_diag_live.vfs_slow_write_overflow_queued),
+    OvmsDiagLoad(&ovms_diag_live.vfs_slow_write_error_state),
+    OvmsDiagLoad(&ovms_diag_live.vfs_slow_write_errno),
+    OvmsDiagLoad(&ovms_diag_live.vfs_slow_write_ferror));
+  can_log_health_line(writer,
+    "sync_io fflush_last_us:%u fflush_max_us:%u fflush_result:%d fsync_last_us:%u fsync_max_us:%u fsync_result:%d\n",
+    OvmsDiagLoad(&ovms_diag_live.vfs_fflush_last_us),
+    OvmsDiagLoad(&ovms_diag_live.vfs_fflush_max_us),
+    OvmsDiagLoad(&ovms_diag_live.vfs_fflush_result),
+    OvmsDiagLoad(&ovms_diag_live.vfs_fsync_last_us),
+    OvmsDiagLoad(&ovms_diag_live.vfs_fsync_max_us),
+    OvmsDiagLoad(&ovms_diag_live.vfs_fsync_result));
 
   ovms_diag_alloc_entry_t alloc_first;
   ovms_diag_alloc_entry_t alloc_latest;
@@ -359,7 +414,7 @@ void can_log_health(int verbosity, OvmsWriter* writer, OvmsCommand* cmd, int arg
 
   const ovms_diag_state_t& prior = boot_data.diag;
   uint32_t previous_valid =
-    prior.version == 3 && prior.panic_snapshot == 1 ? 1U : 0U;
+    prior.version == 4 && prior.panic_snapshot == 1 ? 1U : 0U;
   can_log_health_line(writer,
     "previous valid:%u synth:%u/%u/%u/%u vfs:%u/%u/%u op:%u parent:%u seq:%u io:%u/%u,%u/%u,%u/%u,%u/%u heap:%u/%u/%u net:%u/%u wifi:%d\n",
     previous_valid,
@@ -389,6 +444,34 @@ void can_log_health(int verbosity, OvmsWriter* writer, OvmsCommand* cmd, int arg
     prior.vfs_owner_attempt_ms, prior.vfs_owner_before_free,
     prior.vfs_owner_before_largest, prior.vfs_owner_after_free,
     prior.vfs_owner_after_largest);
+  can_log_health_line(writer,
+    "previous_lifecycle valid:%u open_seq:%u stage:%u\n",
+    previous_valid, prior.vfs_lifecycle_sequence, prior.vfs_lifecycle_stage);
+  for (size_t i = 0; i < OVMS_DIAG_VFS_LIFECYCLE_COUNT; ++i)
+    {
+    const ovms_diag_vfs_heap_stage_t& stage = prior.vfs_lifecycle[i];
+    can_log_health_line(writer,
+      "previous_vfs_heap valid:%u stage:%s seq:%u ms:%u dma_free:%u dma_largest:%u\n",
+      previous_valid, can_log_vfs_lifecycle_names[i], stage.sequence,
+      stage.monotonic_ms, stage.dma_free, stage.dma_largest);
+    }
+  can_log_health_line(writer,
+    "previous_slow_write valid:%u threshold_us:%u seq:%u requested:%u accepted:%u file_offset:%u cluster_offset:%u batch_used:%u batch_capacity:%u elapsed_us:%u sync_due_ms:%u sync_state:%u primary:%u overflow:%u error:%u errno:%d ferror:%d\n",
+    previous_valid, prior.vfs_slow_write_threshold_us,
+    prior.vfs_slow_write_sequence, prior.vfs_slow_write_requested,
+    prior.vfs_slow_write_accepted, prior.vfs_slow_write_file_offset,
+    prior.vfs_slow_write_cluster_offset, prior.vfs_slow_write_batch_used,
+    prior.vfs_slow_write_batch_capacity, prior.vfs_slow_write_elapsed_us,
+    prior.vfs_slow_write_sync_due_ms, prior.vfs_slow_write_sync_state,
+    prior.vfs_slow_write_primary_queued,
+    prior.vfs_slow_write_overflow_queued,
+    prior.vfs_slow_write_error_state, prior.vfs_slow_write_errno,
+    prior.vfs_slow_write_ferror);
+  can_log_health_line(writer,
+    "previous_sync_io valid:%u fflush_last_us:%u fflush_max_us:%u fflush_result:%d fsync_last_us:%u fsync_max_us:%u fsync_result:%d\n",
+    previous_valid, prior.vfs_fflush_last_us, prior.vfs_fflush_max_us,
+    prior.vfs_fflush_result, prior.vfs_fsync_last_us,
+    prior.vfs_fsync_max_us, prior.vfs_fsync_result);
   can_log_health_line(writer,
     "previous_alloc_first valid:%u total:%u seq:%u source:%u requested:%u ms:%u ifree:%u ilargest:%u dfree:%u dlargest:%u sfree:%u slargest:%u\n",
     previous_valid && prior.alloc_failure_first.source != OVMS_DIAG_ALLOC_NONE
