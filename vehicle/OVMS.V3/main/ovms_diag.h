@@ -1,13 +1,6 @@
 /*
 ;    Project:       Open Vehicle Monitor System
-;    Date:          14th March 2017
-;
-;    Changes:
-;    1.0  Initial release
-;
-;    (C) 2011       Michael Stegen / Stegen Electronics
-;    (C) 2011-2017  Mark Webb-Johnson
-;    (C) 2011        Sonny Chen @ EPRO/DX
+;    Date:          23rd August 2026
 ;
 ; Permission is hereby granted, free of charge, to any person obtaining a copy
 ; of this software and associated documentation files (the "Software"), to deal
@@ -28,32 +21,44 @@
 ; THE SOFTWARE.
 */
 
-#ifndef __OVMS_MALLOC_H__
-#define __OVMS_MALLOC_H__
+#ifndef __OVMS_DIAG_H__
+#define __OVMS_DIAG_H__
 
 #include <stddef.h>
-#include "ovms_diag.h"
+
+// Fixed numeric source identifiers keep allocation-failure recording usable
+// from both C and C++ without allocating diagnostic strings.
+typedef enum
+  {
+  OVMS_DIAG_ALLOC_NONE = 0,
+  OVMS_DIAG_ALLOC_EXTERNAL_MALLOC_SPIRAM = 1,
+  OVMS_DIAG_ALLOC_EXTERNAL_MALLOC_FALLBACK = 2,
+  OVMS_DIAG_ALLOC_EXTERNAL_CALLOC_SPIRAM = 3,
+  OVMS_DIAG_ALLOC_EXTERNAL_CALLOC_FALLBACK = 4,
+  OVMS_DIAG_ALLOC_EXTERNAL_REALLOC_SPIRAM = 5,
+  OVMS_DIAG_ALLOC_EXTERNAL_REALLOC_FALLBACK = 6,
+  OVMS_DIAG_ALLOC_MONGOOSE_MALLOC = 7,
+  OVMS_DIAG_ALLOC_MONGOOSE_CALLOC = 8,
+  OVMS_DIAG_ALLOC_MONGOOSE_REALLOC = 9,
+  OVMS_DIAG_ALLOC_MONGOOSE_SEND = 10,
+  OVMS_DIAG_ALLOC_SSH_CONSOLE = 11,
+  OVMS_DIAG_ALLOC_SSH_EVENT_QUEUE = 12,
+  OVMS_DIAG_ALLOC_SSH_CONTEXT = 13,
+  OVMS_DIAG_ALLOC_SSH_SESSION = 14,
+  OVMS_DIAG_ALLOC_WOLFSSL_MALLOC = 15,
+  OVMS_DIAG_ALLOC_WOLFSSL_REALLOC = 16,
+  OVMS_DIAG_ALLOC_VFS_OWNER_BATCH = 17,
+  } ovms_diag_alloc_source_t;
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-void* ExternalRamMalloc(size_t sz);
-void* ExternalRamCalloc(size_t count, size_t size);
-void* ExternalRamRealloc(void *ptr, size_t size);
-
-// Mongoose-specific wrappers preserve the existing SPIRAM-first allocation
-// policy while identifying a terminal allocation failure as Mongoose-owned.
-void* OvmsMongooseMalloc(size_t sz);
-void* OvmsMongooseCalloc(size_t count, size_t size);
-void* OvmsMongooseRealloc(void *ptr, size_t size);
-
-void* InternalRamMalloc(size_t sz);
-void* InternalRamCalloc(size_t count, size_t size);
-void* InternalRamRealloc(void *ptr, size_t size);
+void OvmsDiagRecordAllocationFailure(ovms_diag_alloc_source_t source,
+  size_t requested);
 
 #ifdef __cplusplus
 }
 #endif
 
-#endif //#ifndef __OVMS_MALLOC_H__
+#endif //#ifndef __OVMS_DIAG_H__

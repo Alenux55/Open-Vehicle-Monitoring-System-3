@@ -226,7 +226,7 @@ void OvmsVehicleSmartEQ::Handlev2Server(){
     m_reboot_ticker = m_reboot_time; // set reboot ticker
   }
   else if (m_reboot_ticker > 0 && --m_reboot_ticker == 0) {
-    MyNetManager.RestartNetwork();
+    MyNetManager.RestartNetwork("smarteq", "v2-disconnected-timeout");
     m_reboot_ticker = m_reboot_time;
   }
 }

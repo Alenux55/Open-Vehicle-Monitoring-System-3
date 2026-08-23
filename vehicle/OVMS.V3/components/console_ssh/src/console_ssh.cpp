@@ -47,6 +47,7 @@
 #include "ovms_events.h"
 #undef byte
 #include "ovms_netmanager.h"
+#include "ovms_boot.h"
 #include "ovms_config.h"
 #include "ovms_ota.h"
 #include <wolfssl/wolfcrypt/memory.h>
@@ -90,6 +91,9 @@ void OvmsSSH::EventHandler(struct mg_connection *nc, int ev, void *p)
       {
       ESP_EARLY_LOGV(tag, "Event MG_EV_ACCEPT conn %p, data %p", nc, p);
       ConsoleSSH* child = new ConsoleSSH(this, nc);
+      if (!child)
+        OvmsDiagRecordAllocationFailure(OVMS_DIAG_ALLOC_SSH_CONSOLE,
+          sizeof(ConsoleSSH));
       nc->user_data = child;
       break;
       }
@@ -198,6 +202,8 @@ void OvmsSSH::NetManInit(std::string event, void* data)
   m_ctx = wolfSSH_CTX_new(WOLFSSH_ENDPOINT_SERVER, NULL);
   if (m_ctx == NULL)
     {
+    OvmsDiagRecordAllocationFailure(OVMS_DIAG_ALLOC_SSH_CONTEXT,
+      sizeof(WOLFSSH_CTX));
     ::printf("\nInsufficient memory to allocate SSH context\n");
     return;
     }
@@ -312,6 +318,9 @@ ConsoleSSH::ConsoleSSH(OvmsSSH* server, struct mg_connection* nc)
   m_server = server;
   m_connection = nc;
   m_queue = xQueueCreate(100, sizeof(Event));
+  if (!m_queue)
+    OvmsDiagRecordAllocationFailure(OVMS_DIAG_ALLOC_SSH_EVENT_QUEUE,
+      100 * sizeof(Event));
   m_ssh = NULL;
   m_state = ACCEPT;
   m_drain = 0;
@@ -325,6 +334,8 @@ ConsoleSSH::ConsoleSSH(OvmsSSH* server, struct mg_connection* nc)
   m_ssh = wolfSSH_new(m_server->ctx());
   if (m_ssh == NULL)
     {
+    OvmsDiagRecordAllocationFailure(OVMS_DIAG_ALLOC_SSH_SESSION,
+      sizeof(WOLFSSH));
     ::printf("Couldn't allocate SSH session data.\n");
     return;
     }
@@ -1245,7 +1256,11 @@ static void* wolfssl_malloc(size_t size)
   {
   void* ptr = ExternalRamMalloc(size);
   if (!ptr)
+    {
+    if (size > 0)
+      OvmsDiagRecordAllocationFailure(OVMS_DIAG_ALLOC_WOLFSSL_MALLOC, size);
     ESP_LOGE(wolfssl_tag, "memory allocation failed for size %zu", size);
+    }
   return ptr;
   }
 
@@ -1258,6 +1273,10 @@ static void* wolfssl_realloc(void* ptr, size_t size)
   {
   void* nptr = ExternalRamRealloc(ptr, size);
   if (!nptr)
+    {
+    if (size > 0)
+      OvmsDiagRecordAllocationFailure(OVMS_DIAG_ALLOC_WOLFSSL_REALLOC, size);
     ESP_LOGE(wolfssl_tag, "memory reallocation failed for size %zu", size);
+    }
   return nptr;
   }

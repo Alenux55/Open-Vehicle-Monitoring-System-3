@@ -825,7 +825,7 @@ void OvmsVehicleSmartED::RestartNetwork() {
     if (m_reboot) {
       MyBoot.Restart();
     } else {
-      MyNetManager.RestartNetwork();
+      MyNetManager.RestartNetwork("smarted", "v2-disconnected-timeout");
     }
     m_reboot_ticker = m_reboot_time * 60;
   }

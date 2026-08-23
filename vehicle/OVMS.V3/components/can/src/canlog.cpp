@@ -30,8 +30,11 @@ static const char *TAG = "canlog";
 #include "can.h"
 #include "canlog.h"
 #include <sys/param.h>
+#include <algorithm>
 #include <ctype.h>
+#include <stdarg.h>
 #include <string.h>
+#include <sys/time.h>
 #include <string>
 #include <sstream>
 #include <iomanip>
@@ -39,7 +42,10 @@ static const char *TAG = "canlog";
 #include "ovms_config.h"
 #include "ovms_command.h"
 #include "ovms_events.h"
+#include "ovms_boot.h"
 #include "ovms_peripherals.h"
+#include "esp_heap_caps.h"
+#include "esp_timer.h"
 #include "metrics_standard.h"
 
 static const char *CAN_PARAM = "can";
@@ -145,6 +151,271 @@ void can_log_status(int verbosity, OvmsWriter* writer, OvmsCommand* cmd, int arg
     }
   }
 
+static void can_log_health_line(OvmsWriter* writer, const char* format, ...)
+  {
+  char line[384];
+  va_list args;
+  va_start(args, format);
+  int length = vsnprintf(line, sizeof(line), format, args);
+  va_end(args);
+  if (length < 0)
+    return;
+  size_t output = std::min(static_cast<size_t>(length), sizeof(line) - 1);
+  writer->write(line, output);
+  }
+
+void can_log_heap(int verbosity, OvmsWriter* writer, OvmsCommand* cmd, int argc, const char* const* argv)
+  {
+  // Sample everything before writing so console output cannot affect the
+  // values being reported. Formatting uses only the fixed stack buffer in
+  // can_log_health_line().
+  const uint32_t internal_caps = MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT;
+  const uint32_t dma_caps = MALLOC_CAP_DMA | MALLOC_CAP_8BIT;
+  const uint32_t spiram_caps = MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT;
+  uint32_t internal_free = static_cast<uint32_t>(
+    heap_caps_get_free_size(internal_caps));
+  uint32_t internal_largest = static_cast<uint32_t>(
+    heap_caps_get_largest_free_block(internal_caps));
+  uint32_t internal_minimum = static_cast<uint32_t>(
+    heap_caps_get_minimum_free_size(internal_caps));
+  uint32_t dma_free = static_cast<uint32_t>(heap_caps_get_free_size(dma_caps));
+  uint32_t dma_largest = static_cast<uint32_t>(
+    heap_caps_get_largest_free_block(dma_caps));
+  uint32_t dma_minimum = static_cast<uint32_t>(
+    heap_caps_get_minimum_free_size(dma_caps));
+  uint32_t spiram_free = static_cast<uint32_t>(
+    heap_caps_get_free_size(spiram_caps));
+  uint32_t spiram_largest = static_cast<uint32_t>(
+    heap_caps_get_largest_free_block(spiram_caps));
+
+  can_log_health_line(writer,
+    "heap_now free:%u largest:%u minimum:%u dma_free:%u dma_largest:%u dma_minimum:%u spiram_free:%u spiram_largest:%u\n",
+    internal_free, internal_largest, internal_minimum,
+    dma_free, dma_largest, dma_minimum, spiram_free, spiram_largest);
+  }
+
+static bool can_log_health_alloc_entry(const ovms_diag_alloc_entry_t& source,
+  ovms_diag_alloc_entry_t& snapshot)
+  {
+  memset(&snapshot, 0, sizeof(snapshot));
+  for (int attempt = 0; attempt < 3; ++attempt)
+    {
+    uint32_t before = __atomic_load_n(&source.guard, __ATOMIC_ACQUIRE);
+    if (before & 1)
+      continue;
+    snapshot.guard = before;
+    snapshot.sequence = OvmsDiagLoad(&source.sequence);
+    snapshot.source = OvmsDiagLoad(&source.source);
+    snapshot.requested = OvmsDiagLoad(&source.requested);
+    snapshot.monotonic_ms = OvmsDiagLoad(&source.monotonic_ms);
+    snapshot.internal_free = OvmsDiagLoad(&source.internal_free);
+    snapshot.internal_largest = OvmsDiagLoad(&source.internal_largest);
+    snapshot.dma_free = OvmsDiagLoad(&source.dma_free);
+    snapshot.dma_largest = OvmsDiagLoad(&source.dma_largest);
+    snapshot.spiram_free = OvmsDiagLoad(&source.spiram_free);
+    snapshot.spiram_largest = OvmsDiagLoad(&source.spiram_largest);
+    uint32_t after = __atomic_load_n(&source.guard, __ATOMIC_ACQUIRE);
+    if (before == after && !(after & 1))
+      return snapshot.source != OVMS_DIAG_ALLOC_NONE;
+    }
+  memset(&snapshot, 0, sizeof(snapshot));
+  return false;
+  }
+
+void can_log_health(int verbosity, OvmsWriter* writer, OvmsCommand* cmd, int argc, const char* const* argv)
+  {
+  // Intentionally no logger-map, CanSynth, VFS, route, formatter or stats
+  // locks, and no dynamic strings. These are relaxed atomic snapshots; fields
+  // can advance between loads, which is preferable to blocking a hot path.
+  struct timeval wall;
+  gettimeofday(&wall, NULL);
+  int64_t mono_us = esp_timer_get_time();
+
+  can_log_health_line(writer,
+    "clock wall_sec:%lld wall_usec:%ld mono_us:%lld\n",
+    static_cast<long long>(wall.tv_sec), static_cast<long>(wall.tv_usec),
+    static_cast<long long>(mono_us));
+  can_log_health_line(writer,
+    "synth state:%u hb:%u gen:%u inj:%u rej:%u last_ms:%u stop_ms:%u\n",
+    OvmsDiagLoad(&ovms_diag_live.synth_state),
+    OvmsDiagLoad(&ovms_diag_live.synth_heartbeat),
+    OvmsDiagLoad(&ovms_diag_live.synth_generated),
+    OvmsDiagLoad(&ovms_diag_live.synth_injected),
+    OvmsDiagLoad(&ovms_diag_live.synth_rejected),
+    OvmsDiagLoad(&ovms_diag_live.synth_last_ms),
+    OvmsDiagLoad(&ovms_diag_live.synth_stopped_ms));
+  can_log_health_line(writer,
+    "vfs active:%u hb:%u primary:%u overflow:%u odrop:%u dequeue:%u format:%u op:%u parent:%u seq:%u start_ms:%u end_ms:%u storage:%u\n",
+    OvmsDiagLoad(&ovms_diag_live.vfs_active),
+    OvmsDiagLoad(&ovms_diag_live.vfs_heartbeat),
+    OvmsDiagLoad(&ovms_diag_live.vfs_primary_enqueue),
+    OvmsDiagLoad(&ovms_diag_live.vfs_overflow_enqueue),
+    OvmsDiagLoad(&ovms_diag_live.vfs_overflow_drop),
+    OvmsDiagLoad(&ovms_diag_live.vfs_dequeue),
+    OvmsDiagLoad(&ovms_diag_live.vfs_format_complete),
+    OvmsDiagLoad(&ovms_diag_live.vfs_op),
+    OvmsDiagLoad(&ovms_diag_live.vfs_parent_op),
+    OvmsDiagLoad(&ovms_diag_live.vfs_op_sequence),
+    OvmsDiagLoad(&ovms_diag_live.vfs_op_started_ms),
+    OvmsDiagLoad(&ovms_diag_live.vfs_op_completed_ms),
+    OvmsDiagLoad(&ovms_diag_live.vfs_storage_error));
+  can_log_health_line(writer,
+    "io batch:%u/%u fwrite:%u/%u fflush:%u/%u fsync:%u/%u\n",
+    OvmsDiagLoad(&ovms_diag_live.vfs_batch_start),
+    OvmsDiagLoad(&ovms_diag_live.vfs_batch_end),
+    OvmsDiagLoad(&ovms_diag_live.vfs_fwrite_start),
+    OvmsDiagLoad(&ovms_diag_live.vfs_fwrite_end),
+    OvmsDiagLoad(&ovms_diag_live.vfs_fflush_start),
+    OvmsDiagLoad(&ovms_diag_live.vfs_fflush_end),
+    OvmsDiagLoad(&ovms_diag_live.vfs_fsync_start),
+    OvmsDiagLoad(&ovms_diag_live.vfs_fsync_end));
+  can_log_health_line(writer,
+    "heap sample_ms:%u free:%u largest:%u minimum:%u dma_free:%u dma_largest:%u dma_minimum:%u\n",
+    OvmsDiagLoad(&ovms_diag_live.heap_sample_ms),
+    OvmsDiagLoad(&ovms_diag_live.heap_internal_free),
+    OvmsDiagLoad(&ovms_diag_live.heap_internal_largest),
+    OvmsDiagLoad(&ovms_diag_live.heap_internal_minimum),
+    OvmsDiagLoad(&ovms_diag_live.heap_dma_free),
+    OvmsDiagLoad(&ovms_diag_live.heap_dma_largest),
+    OvmsDiagLoad(&ovms_diag_live.heap_dma_minimum));
+  can_log_health_line(writer,
+    "vfs_stage queues_free:%u queues_largest:%u task_free:%u task_largest:%u\n",
+    OvmsDiagLoad(&ovms_diag_live.vfs_queues_ready_free),
+    OvmsDiagLoad(&ovms_diag_live.vfs_queues_ready_largest),
+    OvmsDiagLoad(&ovms_diag_live.vfs_task_ready_free),
+    OvmsDiagLoad(&ovms_diag_live.vfs_task_ready_largest));
+  can_log_health_line(writer,
+    "vfs_owner seq:%u result:%u requested:%u caps:%u attempt_ms:%u before_free:%u before_largest:%u after_free:%u after_largest:%u\n",
+    OvmsDiagLoad(&ovms_diag_live.vfs_owner_sequence),
+    __atomic_load_n(&ovms_diag_live.vfs_owner_result, __ATOMIC_ACQUIRE),
+    OvmsDiagLoad(&ovms_diag_live.vfs_owner_requested),
+    OvmsDiagLoad(&ovms_diag_live.vfs_owner_caps),
+    OvmsDiagLoad(&ovms_diag_live.vfs_owner_attempt_ms),
+    OvmsDiagLoad(&ovms_diag_live.vfs_owner_before_free),
+    OvmsDiagLoad(&ovms_diag_live.vfs_owner_before_largest),
+    OvmsDiagLoad(&ovms_diag_live.vfs_owner_after_free),
+    OvmsDiagLoad(&ovms_diag_live.vfs_owner_after_largest));
+
+  ovms_diag_alloc_entry_t alloc_first;
+  ovms_diag_alloc_entry_t alloc_latest;
+  bool alloc_first_valid = can_log_health_alloc_entry(
+    ovms_diag_live.alloc_failure_first, alloc_first);
+  bool alloc_latest_valid = can_log_health_alloc_entry(
+    ovms_diag_live.alloc_failure_latest, alloc_latest);
+  uint32_t alloc_total = OvmsDiagLoad(&ovms_diag_live.alloc_failure_count);
+  can_log_health_line(writer,
+    "alloc_first valid:%u total:%u seq:%u source:%u requested:%u ms:%u ifree:%u ilargest:%u dfree:%u dlargest:%u sfree:%u slargest:%u\n",
+    alloc_first_valid ? 1U : 0U, alloc_total, alloc_first.sequence,
+    alloc_first.source, alloc_first.requested, alloc_first.monotonic_ms,
+    alloc_first.internal_free, alloc_first.internal_largest,
+    alloc_first.dma_free, alloc_first.dma_largest, alloc_first.spiram_free,
+    alloc_first.spiram_largest);
+  can_log_health_line(writer,
+    "alloc_latest valid:%u total:%u seq:%u source:%u requested:%u ms:%u ifree:%u ilargest:%u dfree:%u dlargest:%u sfree:%u slargest:%u\n",
+    alloc_latest_valid ? 1U : 0U, alloc_total, alloc_latest.sequence,
+    alloc_latest.source, alloc_latest.requested, alloc_latest.monotonic_ms,
+    alloc_latest.internal_free, alloc_latest.internal_largest,
+    alloc_latest.dma_free, alloc_latest.dma_largest, alloc_latest.spiram_free,
+    alloc_latest.spiram_largest);
+
+  char source[sizeof(ovms_diag_live.net_restart_source)];
+  char reason[sizeof(ovms_diag_live.net_restart_reason)];
+  uint32_t before = 0, after = 0;
+  for (int attempt = 0; attempt < 3; ++attempt)
+    {
+    before = __atomic_load_n(&ovms_diag_live.net_restart_text_sequence, __ATOMIC_ACQUIRE);
+    if (before & 1)
+      continue;
+    memcpy(source, ovms_diag_live.net_restart_source, sizeof(source));
+    memcpy(reason, ovms_diag_live.net_restart_reason, sizeof(reason));
+    after = __atomic_load_n(&ovms_diag_live.net_restart_text_sequence, __ATOMIC_ACQUIRE);
+    if (before == after)
+      break;
+    }
+  source[sizeof(source) - 1] = 0;
+  reason[sizeof(reason) - 1] = 0;
+  if (before != after || (after & 1))
+    {
+    strlcpy(source, "updating", sizeof(source));
+    strlcpy(reason, "updating", sizeof(reason));
+    }
+  else
+    {
+    if (!source[0])
+      strlcpy(source, "-", sizeof(source));
+    if (!reason[0])
+      strlcpy(reason, "-", sizeof(reason));
+    }
+  can_log_health_line(writer,
+    "net hb:%u last_ms:%u requests:%u executes:%u request_ms:%u execute_ms:%u source:%s reason:%s wifi_storage:%d wifi_ms:%u\n",
+    OvmsDiagLoad(&ovms_diag_live.netman_heartbeat),
+    OvmsDiagLoad(&ovms_diag_live.netman_last_ms),
+    OvmsDiagLoad(&ovms_diag_live.net_restart_requests),
+    OvmsDiagLoad(&ovms_diag_live.net_restart_executes),
+    OvmsDiagLoad(&ovms_diag_live.net_restart_requested_ms),
+    OvmsDiagLoad(&ovms_diag_live.net_restart_executed_ms), source, reason,
+    OvmsDiagLoad(&ovms_diag_live.wifi_storage_result),
+    OvmsDiagLoad(&ovms_diag_live.wifi_storage_ms));
+
+  const ovms_diag_state_t& prior = boot_data.diag;
+  uint32_t previous_valid =
+    prior.version == 3 && prior.panic_snapshot == 1 ? 1U : 0U;
+  can_log_health_line(writer,
+    "previous valid:%u synth:%u/%u/%u/%u vfs:%u/%u/%u op:%u parent:%u seq:%u io:%u/%u,%u/%u,%u/%u,%u/%u heap:%u/%u/%u net:%u/%u wifi:%d\n",
+    previous_valid,
+    prior.synth_state, prior.synth_generated, prior.synth_injected,
+    prior.synth_rejected, prior.vfs_heartbeat, prior.vfs_dequeue,
+    prior.vfs_format_complete, prior.vfs_op, prior.vfs_parent_op,
+    prior.vfs_op_sequence, prior.vfs_batch_start, prior.vfs_batch_end,
+    prior.vfs_fwrite_start, prior.vfs_fwrite_end, prior.vfs_fflush_start,
+    prior.vfs_fflush_end, prior.vfs_fsync_start, prior.vfs_fsync_end,
+    prior.heap_internal_free, prior.heap_internal_largest,
+    prior.heap_internal_minimum, prior.net_restart_requests,
+    prior.net_restart_executes, prior.wifi_storage_result);
+  can_log_health_line(writer,
+    "previous_heap valid:%u sample_ms:%u free:%u largest:%u minimum:%u dma_free:%u dma_largest:%u dma_minimum:%u\n",
+    previous_valid, prior.heap_sample_ms, prior.heap_internal_free,
+    prior.heap_internal_largest, prior.heap_internal_minimum,
+    prior.heap_dma_free, prior.heap_dma_largest, prior.heap_dma_minimum);
+  can_log_health_line(writer,
+    "previous_stage valid:%u queues_free:%u queues_largest:%u task_free:%u task_largest:%u\n",
+    previous_valid, prior.vfs_queues_ready_free,
+    prior.vfs_queues_ready_largest, prior.vfs_task_ready_free,
+    prior.vfs_task_ready_largest);
+  can_log_health_line(writer,
+    "previous_owner valid:%u seq:%u result:%u requested:%u caps:%u attempt_ms:%u before_free:%u before_largest:%u after_free:%u after_largest:%u\n",
+    previous_valid, prior.vfs_owner_sequence, prior.vfs_owner_result,
+    prior.vfs_owner_requested, prior.vfs_owner_caps,
+    prior.vfs_owner_attempt_ms, prior.vfs_owner_before_free,
+    prior.vfs_owner_before_largest, prior.vfs_owner_after_free,
+    prior.vfs_owner_after_largest);
+  can_log_health_line(writer,
+    "previous_alloc_first valid:%u total:%u seq:%u source:%u requested:%u ms:%u ifree:%u ilargest:%u dfree:%u dlargest:%u sfree:%u slargest:%u\n",
+    previous_valid && prior.alloc_failure_first.source != OVMS_DIAG_ALLOC_NONE
+      ? 1U : 0U,
+    prior.alloc_failure_count, prior.alloc_failure_first.sequence,
+    prior.alloc_failure_first.source, prior.alloc_failure_first.requested,
+    prior.alloc_failure_first.monotonic_ms,
+    prior.alloc_failure_first.internal_free,
+    prior.alloc_failure_first.internal_largest,
+    prior.alloc_failure_first.dma_free, prior.alloc_failure_first.dma_largest,
+    prior.alloc_failure_first.spiram_free,
+    prior.alloc_failure_first.spiram_largest);
+  can_log_health_line(writer,
+    "previous_alloc_latest valid:%u total:%u seq:%u source:%u requested:%u ms:%u ifree:%u ilargest:%u dfree:%u dlargest:%u sfree:%u slargest:%u\n",
+    previous_valid && prior.alloc_failure_latest.source != OVMS_DIAG_ALLOC_NONE
+      ? 1U : 0U,
+    prior.alloc_failure_count, prior.alloc_failure_latest.sequence,
+    prior.alloc_failure_latest.source, prior.alloc_failure_latest.requested,
+    prior.alloc_failure_latest.monotonic_ms,
+    prior.alloc_failure_latest.internal_free,
+    prior.alloc_failure_latest.internal_largest,
+    prior.alloc_failure_latest.dma_free,
+    prior.alloc_failure_latest.dma_largest,
+    prior.alloc_failure_latest.spiram_free,
+    prior.alloc_failure_latest.spiram_largest);
+  }
+
 void can_log_list(int verbosity, OvmsWriter* writer, OvmsCommand* cmd, int argc, const char* const* argv)
   {
   if (!MyCan.HasLogger())
@@ -187,6 +458,8 @@ OvmsCanLogInit::OvmsCanLogInit()
   OvmsCommand* cmd_canlog = cmd_can->RegisterCommand("log", "CAN logging framework");
   cmd_canlog->RegisterCommand("stop", "Stop logging", can_log_stop,"[<id>]",0,1);
   cmd_canlog->RegisterCommand("status", "Logging status", can_log_status,"[<id>]",0,1);
+  cmd_canlog->RegisterCommand("heap", "Current CAN/VFS heap topology", can_log_heap);
+  cmd_canlog->RegisterCommand("health", "Compact lock-free CAN/VFS health", can_log_health);
   cmd_canlog->RegisterCommand("list", "Logging list", can_log_list);
   cmd_canlog->RegisterCommand("start", "CAN logging start framework");
   }
@@ -339,7 +612,7 @@ std::string canlogconnection::GetStats()
 // CAN Logger class
 ////////////////////////////////////////////////////////////////////////
 
-canlog::canlog(const char* type, std::string format, canformat::canformat_serve_mode_t mode)
+canlog::canlog(const char* type, std::string format, canformat::canformat_serve_mode_t mode, bool start_task)
   : m_events_filters(TAG), m_metrics_filters(TAG)
   {
   m_type = type;
@@ -361,10 +634,16 @@ canlog::canlog(const char* type, std::string format, canformat::canformat_serve_
   MyEvents.RegisterEvent(IDTAG,"config.changed", std::bind(&canlog::UpdatedConfig, this, _1, _2));
   MyMetrics.RegisterListener(IDTAG, "*", std::bind(&canlog::MetricListener, this, _1));
 
-  int queuesize = MyConfig.GetParamValueInt(CAN_PARAM, "log.queuesize",100);
+  m_task = NULL;
+  m_queue = NULL;
+
   LoadConfig();
-  m_queue = xQueueCreate(queuesize, sizeof(CAN_log_message_t));
-  xTaskCreatePinnedToCore(RxTask, "OVMS CanLog", 4096, (void*)this, 10, &m_task, CORE(1));
+  if (start_task)
+    {
+    int queuesize = MyConfig.GetParamValueInt(CAN_PARAM, "log.queuesize",100);
+    m_queue = xQueueCreate(queuesize, sizeof(CAN_log_message_t));
+    xTaskCreatePinnedToCore(RxTask, "OVMS CanLog", 4096, (void*)this, 10, &m_task, CORE(1));
+    }
   }
 
 canlog::~canlog()

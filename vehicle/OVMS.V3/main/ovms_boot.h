@@ -38,6 +38,7 @@
 #include "esp_system.h"
 #include "ovms_events.h"
 #include "ovms_mutex.h"
+#include "ovms_diag.h"
 
 typedef enum
   {
@@ -79,6 +80,147 @@ typedef struct
   uint32_t stackfree;
   } task_info_t;
 
+// Small, bounded diagnostic breadcrumbs for the CanSynth/CanLogVFS failure
+// investigation. The live copy stays in normal DRAM; the panic handler copies
+// it to boot_data once, so hot paths never write RTC slow memory or update the
+// boot-data CRC.
+enum ovms_diag_synth_state_t : uint32_t
+  {
+  OVMS_DIAG_SYNTH_NEVER = 0,
+  OVMS_DIAG_SYNTH_RUNNING,
+  OVMS_DIAG_SYNTH_DURATION,
+  OVMS_DIAG_SYNTH_MANUAL,
+  OVMS_DIAG_SYNTH_START_FAILED,
+  };
+
+enum ovms_diag_vfs_op_t : uint32_t
+  {
+  OVMS_DIAG_VFS_IDLE = 0,
+  OVMS_DIAG_VFS_FORMAT,
+  OVMS_DIAG_VFS_BATCH_FLUSH,
+  OVMS_DIAG_VFS_FWRITE,
+  OVMS_DIAG_VFS_FFLUSH,
+  OVMS_DIAG_VFS_FSYNC,
+  };
+
+enum ovms_diag_vfs_owner_result_t : uint32_t
+  {
+  OVMS_DIAG_VFS_OWNER_NONE = 0,
+  OVMS_DIAG_VFS_OWNER_ATTEMPTING,
+  OVMS_DIAG_VFS_OWNER_SUCCESS,
+  OVMS_DIAG_VFS_OWNER_FAILED,
+  };
+
+typedef struct
+  {
+  // Even guard values identify stable snapshots; odd means a writer owns the
+  // entry. All remaining fields are fixed-width and are written atomically.
+  uint32_t guard;
+  uint32_t sequence;
+  uint32_t source;
+  uint32_t requested;
+  uint32_t monotonic_ms;
+  uint32_t internal_free;
+  uint32_t internal_largest;
+  uint32_t dma_free;
+  uint32_t dma_largest;
+  uint32_t spiram_free;
+  uint32_t spiram_largest;
+  } ovms_diag_alloc_entry_t;
+
+typedef struct
+  {
+  uint32_t version;
+  uint32_t panic_snapshot;
+
+  uint32_t synth_state;
+  uint32_t synth_heartbeat;
+  uint32_t synth_generated;
+  uint32_t synth_injected;
+  uint32_t synth_rejected;
+  uint32_t synth_last_ms;
+  uint32_t synth_stopped_ms;
+
+  uint32_t vfs_active;
+  uint32_t vfs_heartbeat;
+  uint32_t vfs_primary_enqueue;
+  uint32_t vfs_overflow_enqueue;
+  uint32_t vfs_overflow_drop;
+  uint32_t vfs_dequeue;
+  uint32_t vfs_format_complete;
+  uint32_t vfs_batch_start;
+  uint32_t vfs_batch_end;
+  uint32_t vfs_fwrite_start;
+  uint32_t vfs_fwrite_end;
+  uint32_t vfs_fflush_start;
+  uint32_t vfs_fflush_end;
+  uint32_t vfs_fsync_start;
+  uint32_t vfs_fsync_end;
+  uint32_t vfs_op;
+  uint32_t vfs_parent_op;
+  uint32_t vfs_op_sequence;
+  uint32_t vfs_op_started_ms;
+  uint32_t vfs_op_completed_ms;
+  uint32_t vfs_storage_error;
+
+  uint32_t heap_sample_ms;
+  uint32_t heap_internal_free;
+  uint32_t heap_internal_largest;
+  uint32_t heap_internal_minimum;
+  uint32_t heap_dma_free;
+  uint32_t heap_dma_largest;
+  uint32_t heap_dma_minimum;
+
+  uint32_t vfs_queues_ready_free;
+  uint32_t vfs_queues_ready_largest;
+  uint32_t vfs_task_ready_free;
+  uint32_t vfs_task_ready_largest;
+
+  uint32_t vfs_owner_sequence;
+  uint32_t vfs_owner_requested;
+  uint32_t vfs_owner_caps;
+  uint32_t vfs_owner_attempt_ms;
+  uint32_t vfs_owner_before_free;
+  uint32_t vfs_owner_before_largest;
+  uint32_t vfs_owner_after_free;
+  uint32_t vfs_owner_after_largest;
+  uint32_t vfs_owner_result;
+
+  uint32_t alloc_failure_count;
+  ovms_diag_alloc_entry_t alloc_failure_first;
+  ovms_diag_alloc_entry_t alloc_failure_latest;
+
+  uint32_t netman_heartbeat;
+  uint32_t netman_last_ms;
+  uint32_t net_restart_requests;
+  uint32_t net_restart_executes;
+  uint32_t net_restart_requested_ms;
+  uint32_t net_restart_executed_ms;
+  uint32_t net_restart_text_sequence;
+  char net_restart_source[16];
+  char net_restart_reason[32];
+  int32_t wifi_storage_result;
+  uint32_t wifi_storage_ms;
+  } ovms_diag_state_t;
+
+static_assert(sizeof(ovms_diag_alloc_entry_t) == 44,
+  "allocation diagnostic entry footprint changed");
+static_assert(sizeof(ovms_diag_state_t) == 376,
+  "diagnostic state footprint changed; review permanent DRAM/RTC cost");
+
+extern ovms_diag_state_t ovms_diag_live;
+
+inline uint32_t OvmsDiagLoad(const uint32_t* field)
+  { return __atomic_load_n(field, __ATOMIC_RELAXED); }
+inline int32_t OvmsDiagLoad(const int32_t* field)
+  { return __atomic_load_n(field, __ATOMIC_RELAXED); }
+inline void OvmsDiagStore(uint32_t* field, uint32_t value)
+  { __atomic_store_n(field, value, __ATOMIC_RELAXED); }
+inline void OvmsDiagStore(int32_t* field, int32_t value)
+  { __atomic_store_n(field, value, __ATOMIC_RELAXED); }
+inline uint32_t OvmsDiagIncrement(uint32_t* field)
+  { return __atomic_add_fetch(field, 1, __ATOMIC_RELAXED); }
+
 typedef struct
   {
   // data consistency:
@@ -108,6 +250,7 @@ typedef struct
   char stack_overflow_taskname[16];
   task_info_t curr_task[portNUM_PROCESSORS];
   bool heap_corruption;
+  ovms_diag_state_t diag;
   } boot_data_t;
 
 extern boot_data_t boot_data;

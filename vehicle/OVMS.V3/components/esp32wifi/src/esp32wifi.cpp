@@ -37,10 +37,12 @@ static const char *TAG = "esp32wifi";
 #include <lwip/dns.h>
 #include "esp32wifi.h"
 #include "esp_wifi.h"
+#include "esp_timer.h"
 #include "ovms.h"
 #include "ovms_config.h"
 #include "ovms_peripherals.h"
 #include "ovms_events.h"
+#include "ovms_boot.h"
 #include "metrics_standard.h"
 #include "ovms_notify.h"
 #include "string_writer.h"
@@ -581,7 +583,12 @@ void esp32wifi::PowerUp()
     OvmsRecMutexLock exclusive(&m_mutex);
     m_wifi_init_cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&m_wifi_init_cfg));
-    ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
+    esp_err_t storage_result = esp_wifi_set_storage(WIFI_STORAGE_RAM);
+    OvmsDiagStore(&ovms_diag_live.wifi_storage_result,
+      static_cast<int32_t>(storage_result));
+    OvmsDiagStore(&ovms_diag_live.wifi_storage_ms,
+      static_cast<uint32_t>(esp_timer_get_time() / 1000));
+    ESP_ERROR_CHECK(storage_result);
     AdjustTaskPriority();
     m_poweredup = true;
     }

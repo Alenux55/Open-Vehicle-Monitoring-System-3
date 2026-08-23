@@ -37,20 +37,35 @@ void* ExternalRamMalloc(size_t sz)
   void* ret = heap_caps_malloc(sz, MALLOC_CAP_SPIRAM);
   if (ret)
     return ret;
-  else
-    return malloc(sz);
+  if (sz > 0)
+    OvmsDiagRecordAllocationFailure(
+      OVMS_DIAG_ALLOC_EXTERNAL_MALLOC_SPIRAM, sz);
+
+  ret = malloc(sz);
+  if (!ret && sz > 0)
+    OvmsDiagRecordAllocationFailure(
+      OVMS_DIAG_ALLOC_EXTERNAL_MALLOC_FALLBACK, sz);
+  return ret;
   }
 
 void* ExternalRamCalloc(size_t count, size_t size)
   {
-  void* ret = heap_caps_malloc(count*size, MALLOC_CAP_SPIRAM);
+  size_t requested = count * size;
+  void* ret = heap_caps_malloc(requested, MALLOC_CAP_SPIRAM);
   if (ret)
     {
-    bzero(ret, count*size);
+    bzero(ret, requested);
     return ret;
     }
-  else
-    return calloc(count, size);
+  if (requested > 0)
+    OvmsDiagRecordAllocationFailure(
+      OVMS_DIAG_ALLOC_EXTERNAL_CALLOC_SPIRAM, requested);
+
+  ret = calloc(count, size);
+  if (!ret && requested > 0)
+    OvmsDiagRecordAllocationFailure(
+      OVMS_DIAG_ALLOC_EXTERNAL_CALLOC_FALLBACK, requested);
+  return ret;
   }
 
 void* ExternalRamRealloc(void *ptr, size_t size)
@@ -65,8 +80,40 @@ void* ExternalRamRealloc(void *ptr, size_t size)
   void* ret = heap_caps_realloc(ptr, size, MALLOC_CAP_SPIRAM);
   if (ret)
     return ret;
-  else
-    return realloc(ptr, size);
+  OvmsDiagRecordAllocationFailure(
+    OVMS_DIAG_ALLOC_EXTERNAL_REALLOC_SPIRAM, size);
+
+  ret = realloc(ptr, size);
+  if (!ret)
+    OvmsDiagRecordAllocationFailure(
+      OVMS_DIAG_ALLOC_EXTERNAL_REALLOC_FALLBACK, size);
+  return ret;
+  }
+
+void* OvmsMongooseMalloc(size_t sz)
+  {
+  void* ret = ExternalRamMalloc(sz);
+  if (!ret && sz > 0)
+    OvmsDiagRecordAllocationFailure(OVMS_DIAG_ALLOC_MONGOOSE_MALLOC, sz);
+  return ret;
+  }
+
+void* OvmsMongooseCalloc(size_t count, size_t size)
+  {
+  size_t requested = count * size;
+  void* ret = ExternalRamCalloc(count, size);
+  if (!ret && requested > 0)
+    OvmsDiagRecordAllocationFailure(OVMS_DIAG_ALLOC_MONGOOSE_CALLOC,
+      requested);
+  return ret;
+  }
+
+void* OvmsMongooseRealloc(void *ptr, size_t size)
+  {
+  void* ret = ExternalRamRealloc(ptr, size);
+  if (!ret && size > 0)
+    OvmsDiagRecordAllocationFailure(OVMS_DIAG_ALLOC_MONGOOSE_REALLOC, size);
+  return ret;
   }
 
 void* InternalRamMalloc(size_t sz)

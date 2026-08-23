@@ -124,7 +124,7 @@ class OvmsNetManager
     void InterfaceUp(std::string event, void* data);
     void ConfigChanged(std::string event, void* data);
     void EventSystemShuttingDown(std::string event, void* data);
-    void RestartNetwork();
+    void RestartNetwork(const char* source="unknown", const char* reason="unspecified");
 
   public:
     void DoSafePrioritiseAndIndicate();

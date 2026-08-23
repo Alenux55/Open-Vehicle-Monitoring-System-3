@@ -80,10 +80,12 @@
 
 // Override memory allocation macros in mongoose.c
 #define CS_COMMON_MG_MEM_H_
-#define MG_MALLOC ExternalRamMalloc
-#define MG_CALLOC ExternalRamCalloc
-#define MG_REALLOC ExternalRamRealloc
+#define MG_MALLOC OvmsMongooseMalloc
+#define MG_CALLOC OvmsMongooseCalloc
+#define MG_REALLOC OvmsMongooseRealloc
 #define MG_FREE free
+#define OVMS_MG_DIAG_SEND_FAILURE(size) \
+  OvmsDiagRecordAllocationFailure(OVMS_DIAG_ALLOC_MONGOOSE_SEND, (size))
 
 // Let mongoose use LWIP getaddrinfo():
 #define MG_ENABLE_SYNC_RESOLVER 1

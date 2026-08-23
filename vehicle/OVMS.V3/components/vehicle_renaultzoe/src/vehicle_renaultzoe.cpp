@@ -1152,7 +1152,7 @@ void OvmsVehicleRenaultZoe::Ticker1(uint32_t ticker) {
     m_reboot_ticker = 5 * 60; // set reboot ticker
   }
   else if (m_reboot_ticker > 0 && --m_reboot_ticker == 0) {
-    MyNetManager.RestartNetwork();
+    MyNetManager.RestartNetwork("renaultzoe", "v2-disconnected-timeout");
     m_reboot_ticker = 5 * 60;
     //MyBoot.Restart(); // restart Module
   }

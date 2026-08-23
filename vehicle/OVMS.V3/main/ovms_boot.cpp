@@ -42,6 +42,8 @@ static const char *TAG = "boot";
 #include "esp_system.h"
 #include "esp_sleep.h"
 #include "esp_idf_version.h"
+#include "esp_heap_caps.h"
+#include "esp_timer.h"
 #if ESP_IDF_VERSION_MAJOR < 4
 #include "esp_panic.h"
 #else
@@ -63,8 +65,72 @@ static const char *TAG = "boot";
 #include <string.h>
 
 boot_data_t __attribute__((section(".rtc.noload"))) boot_data;
+ovms_diag_state_t ovms_diag_live;
 
 Boot MyBoot __attribute__ ((init_priority (1100)));
+
+static bool OvmsDiagWriteAllocationEntry(ovms_diag_alloc_entry_t* entry,
+  uint32_t sequence, ovms_diag_alloc_source_t source, uint32_t requested,
+  uint32_t monotonic_ms, uint32_t internal_free, uint32_t internal_largest,
+  uint32_t dma_free, uint32_t dma_largest, uint32_t spiram_free,
+  uint32_t spiram_largest)
+  {
+  uint32_t guard = __atomic_load_n(&entry->guard, __ATOMIC_ACQUIRE);
+  for (int attempt = 0; attempt < 3; ++attempt)
+    {
+    if (guard & 1)
+      return false;
+    if (__atomic_compare_exchange_n(&entry->guard, &guard, guard + 1, false,
+          __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+      {
+      OvmsDiagStore(&entry->sequence, sequence);
+      OvmsDiagStore(&entry->source, static_cast<uint32_t>(source));
+      OvmsDiagStore(&entry->requested, requested);
+      OvmsDiagStore(&entry->monotonic_ms, monotonic_ms);
+      OvmsDiagStore(&entry->internal_free, internal_free);
+      OvmsDiagStore(&entry->internal_largest, internal_largest);
+      OvmsDiagStore(&entry->dma_free, dma_free);
+      OvmsDiagStore(&entry->dma_largest, dma_largest);
+      OvmsDiagStore(&entry->spiram_free, spiram_free);
+      OvmsDiagStore(&entry->spiram_largest, spiram_largest);
+      __atomic_store_n(&entry->guard, guard + 2, __ATOMIC_RELEASE);
+      return true;
+      }
+    }
+  return false;
+  }
+
+extern "C" void OvmsDiagRecordAllocationFailure(
+  ovms_diag_alloc_source_t source, size_t requested)
+  {
+  if (source == OVMS_DIAG_ALLOC_NONE)
+    return;
+
+  uint32_t sequence = OvmsDiagIncrement(&ovms_diag_live.alloc_failure_count);
+  uint32_t request32 = requested > UINT32_MAX
+    ? UINT32_MAX : static_cast<uint32_t>(requested);
+  uint32_t monotonic_ms = static_cast<uint32_t>(esp_timer_get_time() / 1000);
+  uint32_t internal_free = static_cast<uint32_t>(heap_caps_get_free_size(
+    MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+  uint32_t internal_largest = static_cast<uint32_t>(
+    heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+  uint32_t dma_free = static_cast<uint32_t>(heap_caps_get_free_size(
+    MALLOC_CAP_DMA | MALLOC_CAP_8BIT));
+  uint32_t dma_largest = static_cast<uint32_t>(
+    heap_caps_get_largest_free_block(MALLOC_CAP_DMA | MALLOC_CAP_8BIT));
+  uint32_t spiram_free = static_cast<uint32_t>(heap_caps_get_free_size(
+    MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+  uint32_t spiram_largest = static_cast<uint32_t>(
+    heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+
+  if (sequence == 1)
+    OvmsDiagWriteAllocationEntry(&ovms_diag_live.alloc_failure_first,
+      sequence, source, request32, monotonic_ms, internal_free,
+      internal_largest, dma_free, dma_largest, spiram_free, spiram_largest);
+  OvmsDiagWriteAllocationEntry(&ovms_diag_live.alloc_failure_latest,
+    sequence, source, request32, monotonic_ms, internal_free,
+    internal_largest, dma_free, dma_largest, spiram_free, spiram_largest);
+  }
 
 extern void xt_unhandled_exception(XtExcFrame *frame);
 
@@ -310,6 +376,9 @@ Boot::Boot()
   m_min_12v_level_override = false;
 
   m_resetreason = esp_reset_reason(); // Note: necessary to link reset_reason module
+
+  memset(&ovms_diag_live, 0, sizeof(ovms_diag_live));
+  ovms_diag_live.version = 3;
 
   if (cpu0 == POWERON_RESET)
     {
@@ -803,6 +872,11 @@ void Boot::ErrorCallback(const void *f, int core_id, bool is_abort, esp_reset_re
 
   // Record final heap corruption result:
   boot_data.heap_corruption = !heap_caps_check_integrity_all(false);
+
+  // Snapshot the normal-DRAM breadcrumbs only at panic time. This deliberately
+  // avoids RTC writes and CRC work in the high-rate CAN/VFS paths.
+  memcpy(&boot_data.diag, &ovms_diag_live, sizeof(boot_data.diag));
+  boot_data.diag.panic_snapshot = 1;
 
   boot_data.crc = boot_data.calc_crc();
   }

@@ -184,7 +184,8 @@ typedef enum
   CAN_txcallback,
   CAN_txfailedcallback,
   CAN_logerror,
-  CAN_logstatus
+  CAN_logstatus,
+  CAN_synthetic_frame       // test-only RX frame: log on CanRx, skip callbacks/listeners
 } CAN_queue_type_t;
 
 // CAN message
@@ -377,9 +378,13 @@ class can : public InternalRamAllocated
 
   private:
     static void CAN_rxtask(void *pvParameters);
+    static void CAN_synthetictask(void *pvParameters);
 
   public:
     void IncomingFrame(CAN_frame_t* p_frame);
+    bool StartSynthetic(uint32_t rate, uint32_t duration, OvmsWriter* writer);
+    bool StopSynthetic(OvmsWriter* writer);
+    void StatusSynthetic(OvmsWriter* writer);
 
   public:
     QueueHandle_t m_rxqueue;
@@ -430,11 +435,37 @@ class can : public InternalRamAllocated
     uint32_t m_player_id;
 
   private:
+    enum synthetic_stop_reason_t
+      {
+      SyntheticNeverRun = 0,
+      SyntheticRunning,
+      SyntheticDuration,
+      SyntheticManual
+      };
+
     canbus* m_buslist[CAN_MAXBUSES];
     CanListenerMap_t m_listeners;
     CanFrameCallbackList_t m_rxcallbacks;
     CanFrameCallbackList_t m_txcallbacks;
     TaskHandle_t m_rxtask;            // Task to handle reception
+
+    // Test-only synthetic RX feeder. The synthetic bus lives for the lifetime
+    // of MyCan so queued CAN/log records can never retain a dangling origin.
+    canbus* m_synthetic_bus;
+    TaskHandle_t m_synthetic_task;
+    OvmsMutex m_synthetic_mutex;
+    volatile bool m_synthetic_stop_requested;
+    bool m_synthetic_active;
+    uint32_t m_synthetic_requested_rate;
+    uint32_t m_synthetic_requested_duration;
+    uint64_t m_synthetic_generated;
+    uint64_t m_synthetic_injected;
+    uint64_t m_synthetic_rejected;
+    uint64_t m_synthetic_late_bursts;
+    uint32_t m_synthetic_stack_free;
+    int64_t m_synthetic_started_us;
+    int64_t m_synthetic_stopped_us;
+    synthetic_stop_reason_t m_synthetic_stop_reason;
   };
 
 extern can MyCan;

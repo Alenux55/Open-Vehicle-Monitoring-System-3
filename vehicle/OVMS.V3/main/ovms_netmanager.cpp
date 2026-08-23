@@ -50,6 +50,7 @@ static const char *TAG = "netmanager";
 #include "ovms_config.h"
 #include "ovms_module.h"
 #include "ovms_boot.h"
+#include "esp_timer.h"
 #ifdef CONFIG_OVMS_DEV_NETMANAGER_PING
 #include "ping/ping_sock.h"
 #endif // CONFIG_OVMS_DEV_NETMANAGER_PING
@@ -122,7 +123,7 @@ void network_restart(int verbosity, OvmsWriter* writer, OvmsCommand* cmd, int ar
   {
   writer->puts("Restarting network...");
   vTaskDelay(pdMS_TO_TICKS(100));
-  MyNetManager.RestartNetwork();
+  MyNetManager.RestartNetwork("shell", "network-restart-command");
   }
 
 #ifdef CONFIG_OVMS_DEV_NETMANAGER_PING
@@ -440,8 +441,34 @@ OvmsNetManager::~OvmsNetManager()
   {
   }
 
-void OvmsNetManager::RestartNetwork()
+void OvmsNetManager::RestartNetwork(const char* source, const char* reason)
   {
+  if (source)
+    {
+    OvmsDiagIncrement(&ovms_diag_live.net_restart_requests);
+    OvmsDiagStore(&ovms_diag_live.net_restart_requested_ms,
+      static_cast<uint32_t>(esp_timer_get_time() / 1000));
+    // Claim the odd sequence value before updating the fixed strings. Restart
+    // requests are rare, but they can originate on different tasks; a bounded
+    // claim prevents two writers from producing a falsely stable mixed pair.
+    uint32_t sequence = __atomic_load_n(
+      &ovms_diag_live.net_restart_text_sequence, __ATOMIC_ACQUIRE);
+    for (int attempt = 0; attempt < 3 && !(sequence & 1); ++attempt)
+      {
+      if (__atomic_compare_exchange_n(&ovms_diag_live.net_restart_text_sequence,
+            &sequence, sequence + 1, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+        {
+        strlcpy(ovms_diag_live.net_restart_source, source,
+          sizeof(ovms_diag_live.net_restart_source));
+        strlcpy(ovms_diag_live.net_restart_reason, reason ? reason : "unspecified",
+          sizeof(ovms_diag_live.net_restart_reason));
+        __atomic_store_n(&ovms_diag_live.net_restart_text_sequence,
+          sequence + 2, __ATOMIC_RELEASE);
+        break;
+        }
+      }
+    }
+
   if (MongooseRunning() && !IsNetManagerTask())
     {
     // signal task to do the restart:
@@ -452,6 +479,9 @@ void OvmsNetManager::RestartNetwork()
     {
     // perform restart:
     ESP_LOGI(TAG, "Performing network restart");
+    OvmsDiagIncrement(&ovms_diag_live.net_restart_executes);
+    OvmsDiagStore(&ovms_diag_live.net_restart_executed_ms,
+      static_cast<uint32_t>(esp_timer_get_time() / 1000));
     m_restart_network = false;
     #ifdef CONFIG_OVMS_COMP_WIFI
       if (MyPeripherals && MyPeripherals->m_esp32wifi)
@@ -996,6 +1026,9 @@ void OvmsNetManager::MongooseTask()
   uint32_t busystart = esp_log_timestamp();
   while (!m_mongoose_stopping && !m_restart_network)
     {
+    OvmsDiagIncrement(&ovms_diag_live.netman_heartbeat);
+    OvmsDiagStore(&ovms_diag_live.netman_last_ms,
+      static_cast<uint32_t>(esp_timer_get_time() / 1000));
     // poll interfaces:
     if (mg_mgr_poll(&m_mongoose_mgr, 100) == 0)
       {
@@ -1049,7 +1082,7 @@ void OvmsNetManager::MongooseTask()
 
   if (m_restart_network)
     {
-    RestartNetwork();
+    RestartNetwork(NULL, NULL);
     }
 
   uint32_t minstackfree = uxTaskGetStackHighWaterMark(NULL);

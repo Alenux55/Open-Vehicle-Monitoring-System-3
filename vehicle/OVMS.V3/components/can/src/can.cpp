@@ -35,6 +35,7 @@
 
 #include "ovms_log.h"
 static const char *TAG = "can";
+static const uint32_t CAN_SYNTHETIC_STACK_SIZE = 1280;
 
 #include "can.h"
 #include "canlog.h"
@@ -42,12 +43,16 @@ static const char *TAG = "can";
 #include "dbc.h"
 #include "dbc_app.h"
 #include <algorithm>
+#include <cerrno>
 #include <ctype.h>
+#include <inttypes.h>
 #include <string.h>
 #include <iomanip>
 #include <cstdio>
+#include "esp_heap_caps.h"
 #include "ovms_config.h"
 #include "ovms_command.h"
+#include "ovms_boot.h"
 #include "metrics_standard.h"
 #include "vehicle_poller.h"
 
@@ -343,6 +348,49 @@ void can_testtx(int verbosity, OvmsWriter* writer, OvmsCommand* cmd, int argc, c
     sbus->Write(&frame, pdMS_TO_TICKS(500));
     if (delayms != 0) vTaskDelay(pdMS_TO_TICKS(delayms));
     }
+  }
+
+static bool can_test_parse_uint(const char* text, uint32_t minval, uint32_t maxval, uint32_t* value)
+  {
+  if (!text || !*text)
+    return false;
+
+  errno = 0;
+  char* end = NULL;
+  unsigned long parsed = strtoul(text, &end, 10);
+  if (errno != 0 || *end != '\0' || parsed < minval || parsed > maxval)
+    return false;
+
+  *value = parsed;
+  return true;
+  }
+
+void can_test_generate(int verbosity, OvmsWriter* writer, OvmsCommand* cmd, int argc, const char* const* argv)
+  {
+  uint32_t rate;
+  uint32_t duration;
+  if (!can_test_parse_uint(argv[0], 1, 10000, &rate))
+    {
+    writer->puts("Error: rate must be an integer from 1 to 10000 records/s");
+    return;
+    }
+  if (!can_test_parse_uint(argv[1], 1, 3600, &duration))
+    {
+    writer->puts("Error: duration must be an integer from 1 to 3600 seconds");
+    return;
+    }
+
+  MyCan.StartSynthetic(rate, duration, writer);
+  }
+
+void can_test_stop(int verbosity, OvmsWriter* writer, OvmsCommand* cmd, int argc, const char* const* argv)
+  {
+  MyCan.StopSynthetic(writer);
+  }
+
+void can_test_status(int verbosity, OvmsWriter* writer, OvmsCommand* cmd, int argc, const char* const* argv)
+  {
+  MyCan.StatusSynthetic(writer);
   }
 
 void can_status(int verbosity, OvmsWriter* writer, OvmsCommand* cmd, int argc, const char* const* argv)
@@ -997,6 +1045,14 @@ void can::CAN_rxtask(void *pvParameters)
         case CAN_logstatus:
           msg.body.bus->LogStatus(CAN_LogStatus_Statistics);
           break;
+        case CAN_synthetic_frame:
+          // Deliberately retain the real CanRx -> logger producer path while
+          // skipping callbacks/listeners, so test traffic cannot reach a
+          // vehicle parser, poller or responder that may transmit CAN frames.
+          msg.body.frame.origin->m_status.packets_rx++;
+          msg.body.frame.origin->m_watchdog_timer = monotonictime;
+          msg.body.frame.origin->LogFrame(CAN_LogFrame_RX, &msg.body.frame);
+          break;
         default:
           break;
         }
@@ -1065,6 +1121,23 @@ static int can_dbc_validate(OvmsWriter* writer, OvmsCommand* cmd, int argc, cons
 
 can::can()
   {
+  m_rxqueue = NULL;
+  m_rxtask = NULL;
+  m_synthetic_bus = NULL;
+  m_synthetic_task = NULL;
+  __atomic_store_n(&m_synthetic_stop_requested, false, __ATOMIC_SEQ_CST);
+  m_synthetic_active = false;
+  m_synthetic_requested_rate = 0;
+  m_synthetic_requested_duration = 0;
+  m_synthetic_generated = 0;
+  m_synthetic_injected = 0;
+  m_synthetic_rejected = 0;
+  m_synthetic_late_bursts = 0;
+  m_synthetic_stack_free = 0;
+  m_synthetic_started_us = 0;
+  m_synthetic_stopped_us = 0;
+  m_synthetic_stop_reason = SyntheticNeverRun;
+
   if (!includeCAN) return;
 
   ESP_LOGI(TAG, "Initialising CAN (4510)");
@@ -1109,13 +1182,252 @@ can::can()
     }
 
   cmd_can->RegisterCommand("list", "List CAN buses", can_list);
+  OvmsCommand* cmd_cantest = cmd_can->RegisterCommand("test", "Test-only synthetic CAN RX load");
+  cmd_cantest->RegisterCommand("generate", "Generate synthetic CAN RX records", can_test_generate,
+    "<rate_records_per_sec> <duration_seconds>", 2, 2);
+  cmd_cantest->RegisterCommand("stop", "Stop synthetic CAN RX generation", can_test_stop);
+  cmd_cantest->RegisterCommand("status", "Show synthetic CAN RX generator status", can_test_status);
 
   m_rxqueue = xQueueCreate(CONFIG_OVMS_HW_CAN_RX_QUEUE_SIZE,sizeof(CAN_queue_msg_t));
   xTaskCreatePinnedToCore(CAN_rxtask, "OVMS CanRx", 2*2048, (void*)this, 23, &m_rxtask, CORE(0));
+
+  // A logger-only origin, intentionally not registered as a physical CAN bus.
+  // Its m_busnumber is -1, so CRTD output identifies generated records as bus 0.
+  m_synthetic_bus = new canbus("can0");
   }
 
 can::~can()
   {
+  }
+
+bool can::StartSynthetic(uint32_t rate, uint32_t duration, OvmsWriter* writer)
+  {
+  OvmsMutexLock lock(&m_synthetic_mutex);
+  if (m_synthetic_active || m_synthetic_task != NULL)
+    {
+    writer->puts("Error: synthetic CAN generator is already active");
+    return false;
+    }
+  if (!m_rxqueue || !m_synthetic_bus)
+    {
+    writer->puts("Error: CAN receive framework is unavailable");
+    return false;
+    }
+
+  __atomic_store_n(&m_synthetic_stop_requested, false, __ATOMIC_SEQ_CST);
+  m_synthetic_active = true;
+  m_synthetic_requested_rate = rate;
+  m_synthetic_requested_duration = duration;
+  m_synthetic_generated = 0;
+  m_synthetic_injected = 0;
+  m_synthetic_rejected = 0;
+  m_synthetic_late_bursts = 0;
+  m_synthetic_stack_free = 0;
+  m_synthetic_started_us = esp_timer_get_time();
+  m_synthetic_stopped_us = 0;
+  m_synthetic_stop_reason = SyntheticRunning;
+  OvmsDiagStore(&ovms_diag_live.synth_state, OVMS_DIAG_SYNTH_RUNNING);
+  OvmsDiagStore(&ovms_diag_live.synth_heartbeat, 0);
+  OvmsDiagStore(&ovms_diag_live.synth_generated, 0);
+  OvmsDiagStore(&ovms_diag_live.synth_injected, 0);
+  OvmsDiagStore(&ovms_diag_live.synth_rejected, 0);
+  OvmsDiagStore(&ovms_diag_live.synth_last_ms,
+    static_cast<uint32_t>(m_synthetic_started_us / 1000));
+  OvmsDiagStore(&ovms_diag_live.synth_stopped_ms, 0);
+
+  BaseType_t result = xTaskCreatePinnedToCore(CAN_synthetictask, "OVMS CanSynth",
+    CAN_SYNTHETIC_STACK_SIZE, (void*)this, 4, &m_synthetic_task, CORE(0));
+  if (result != pdPASS)
+    {
+    m_synthetic_active = false;
+    m_synthetic_task = NULL;
+    m_synthetic_stopped_us = esp_timer_get_time();
+    m_synthetic_stop_reason = SyntheticNeverRun;
+    OvmsDiagStore(&ovms_diag_live.synth_state, OVMS_DIAG_SYNTH_START_FAILED);
+    OvmsDiagStore(&ovms_diag_live.synth_stopped_ms,
+      static_cast<uint32_t>(m_synthetic_stopped_us / 1000));
+    size_t internal_free = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    size_t internal_largest = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    char reply[192];
+    snprintf(reply, sizeof(reply),
+      "Error: could not create synthetic CAN generator task"
+      " Stack:%" PRIu32 " InternalFree:%zu InternalLargest:%zu",
+      CAN_SYNTHETIC_STACK_SIZE, internal_free, internal_largest);
+    writer->puts(reply);
+    return false;
+    }
+
+  m_synthetic_stack_free = CAN_SYNTHETIC_STACK_SIZE;
+  // ConsoleSSH::printf uses vasprintf. Immediately after allocating the
+  // CanSynth task, internal heap may be too fragmented for that temporary
+  // allocation even though task creation succeeded, silently losing the
+  // acknowledgement. Keep the established response text, but format it in a
+  // bounded stack buffer and send it through the allocation-free puts path.
+  char reply[192];
+  snprintf(reply, sizeof(reply),
+    "Synthetic CAN RX started: rate=%" PRIu32 "/s duration=%" PRIu32
+    "s origin=can0 task=OVMS CanSynth core=0 priority=4 stack=%" PRIu32,
+    rate, duration, CAN_SYNTHETIC_STACK_SIZE);
+  writer->puts(reply);
+  return true;
+  }
+
+bool can::StopSynthetic(OvmsWriter* writer)
+  {
+  OvmsMutexLock lock(&m_synthetic_mutex);
+  if (!m_synthetic_active || m_synthetic_task == NULL)
+    {
+    writer->puts("Error: synthetic CAN generator is not active");
+    return false;
+    }
+
+  __atomic_store_n(&m_synthetic_stop_requested, true, __ATOMIC_SEQ_CST);
+  writer->puts("Synthetic CAN RX stop requested");
+  return true;
+  }
+
+void can::StatusSynthetic(OvmsWriter* writer)
+  {
+  OvmsMutexLock lock(&m_synthetic_mutex);
+  uint32_t stack_free = m_synthetic_task
+    ? (uint32_t)uxTaskGetStackHighWaterMark(m_synthetic_task)
+    : m_synthetic_stack_free;
+  int64_t stopped = m_synthetic_active ? esp_timer_get_time() : m_synthetic_stopped_us;
+  int64_t elapsed = (m_synthetic_started_us > 0 && stopped >= m_synthetic_started_us)
+    ? stopped - m_synthetic_started_us : 0;
+  double actual_rate = elapsed > 0
+    ? (double)m_synthetic_injected * 1000000.0 / (double)elapsed : 0.0;
+  const char* reason = "never";
+  switch (m_synthetic_stop_reason)
+    {
+    case SyntheticRunning:  reason = "running"; break;
+    case SyntheticDuration: reason = "duration"; break;
+    case SyntheticManual:   reason = "manual"; break;
+    default: break;
+    }
+
+  writer->printf("SyntheticActive:%d SyntheticRequestedRate:%" PRIu32
+    " SyntheticRequestedDuration:%" PRIu32 "s SyntheticGenerated:%" PRIu64
+    " SyntheticInjected:%" PRIu64 " SyntheticRejected:%" PRIu64
+    " SyntheticElapsed:%.3fs SyntheticActualRate:%.1f/s SyntheticLateBursts:%" PRIu64
+    " SyntheticStackFree:%" PRIu32 " SyntheticStop:%s\n",
+    m_synthetic_active ? 1 : 0,
+    m_synthetic_requested_rate, m_synthetic_requested_duration,
+    m_synthetic_generated, m_synthetic_injected, m_synthetic_rejected,
+    (double)elapsed / 1000000.0, actual_rate, m_synthetic_late_bursts,
+    stack_free, reason);
+  }
+
+void can::CAN_synthetictask(void *pvParameters)
+  {
+  can* me = (can*)pvParameters;
+  const int64_t interval_us = 10000;
+  uint32_t rate;
+  uint32_t duration;
+  int64_t started;
+  {
+  OvmsMutexLock lock(&me->m_synthetic_mutex);
+  rate = me->m_synthetic_requested_rate;
+  duration = me->m_synthetic_requested_duration;
+  started = me->m_synthetic_started_us;
+  }
+
+  const int64_t finish_at = started + (int64_t)duration * 1000000;
+  int64_t next_burst = started;
+  TickType_t last_wake = xTaskGetTickCount();
+  const TickType_t interval_ticks = pdMS_TO_TICKS(10);
+  uint64_t pacing_credit = 0;
+  uint64_t generated = 0;
+  uint64_t injected = 0;
+  uint64_t rejected = 0;
+  uint64_t late_bursts = 0;
+  uint32_t sequence = 0;
+  bool manual = false;
+
+  while (true)
+    {
+    if (__atomic_load_n(&me->m_synthetic_stop_requested, __ATOMIC_SEQ_CST))
+      {
+      manual = true;
+      break;
+      }
+
+    int64_t now = esp_timer_get_time();
+    if (now >= finish_at)
+      break;
+    if (now > next_burst + 2000)
+      {
+      late_bursts++;
+      // Do not issue large catch-up bursts: resume a steady cadence instead.
+      next_burst = now;
+      last_wake = xTaskGetTickCount();
+      }
+
+    pacing_credit += (uint64_t)rate * (uint64_t)interval_us;
+    uint32_t burst = pacing_credit / 1000000;
+    pacing_credit %= 1000000;
+
+    for (uint32_t k = 0; k < burst; k++)
+      {
+      CAN_queue_msg_t msg = {};
+      msg.type = CAN_synthetic_frame;
+      msg.body.frame.origin = me->m_synthetic_bus;
+      msg.body.frame.callback = NULL;
+      msg.body.frame.FIR.U = 0;
+      msg.body.frame.FIR.B.DLC = 8;
+      msg.body.frame.FIR.B.FF = CAN_frame_std;
+      msg.body.frame.MsgID = 0x600 + (sequence & 0xff);
+      msg.body.frame.data.u32[0] = sequence;
+      msg.body.frame.data.u32[1] = sequence ^ 0xa5a55a5a;
+      sequence++;
+      generated++;
+
+      if (xQueueSend(me->m_rxqueue, &msg, 0) == pdTRUE)
+        injected++;
+      else
+        rejected++;
+      }
+
+    {
+    OvmsMutexLock lock(&me->m_synthetic_mutex);
+    me->m_synthetic_generated = generated;
+    me->m_synthetic_injected = injected;
+    me->m_synthetic_rejected = rejected;
+    me->m_synthetic_late_bursts = late_bursts;
+    }
+    OvmsDiagStore(&ovms_diag_live.synth_generated, static_cast<uint32_t>(generated));
+    OvmsDiagStore(&ovms_diag_live.synth_injected, static_cast<uint32_t>(injected));
+    OvmsDiagStore(&ovms_diag_live.synth_rejected, static_cast<uint32_t>(rejected));
+    OvmsDiagStore(&ovms_diag_live.synth_last_ms,
+      static_cast<uint32_t>(esp_timer_get_time() / 1000));
+    OvmsDiagIncrement(&ovms_diag_live.synth_heartbeat);
+    next_burst += interval_us;
+    vTaskDelayUntil(&last_wake, interval_ticks);
+    }
+
+  int64_t stopped = esp_timer_get_time();
+  uint32_t stack_free = (uint32_t)uxTaskGetStackHighWaterMark(NULL);
+  {
+  OvmsMutexLock lock(&me->m_synthetic_mutex);
+  me->m_synthetic_generated = generated;
+  me->m_synthetic_injected = injected;
+  me->m_synthetic_rejected = rejected;
+  me->m_synthetic_late_bursts = late_bursts;
+  me->m_synthetic_stack_free = stack_free;
+  me->m_synthetic_stopped_us = stopped;
+  me->m_synthetic_active = false;
+  me->m_synthetic_task = NULL;
+  me->m_synthetic_stop_reason = manual ? SyntheticManual : SyntheticDuration;
+  }
+  OvmsDiagStore(&ovms_diag_live.synth_generated, static_cast<uint32_t>(generated));
+  OvmsDiagStore(&ovms_diag_live.synth_injected, static_cast<uint32_t>(injected));
+  OvmsDiagStore(&ovms_diag_live.synth_rejected, static_cast<uint32_t>(rejected));
+  OvmsDiagStore(&ovms_diag_live.synth_last_ms, static_cast<uint32_t>(stopped / 1000));
+  OvmsDiagStore(&ovms_diag_live.synth_stopped_ms, static_cast<uint32_t>(stopped / 1000));
+  OvmsDiagStore(&ovms_diag_live.synth_state,
+    manual ? OVMS_DIAG_SYNTH_MANUAL : OVMS_DIAG_SYNTH_DURATION);
+
+  vTaskDelete(NULL);
   }
 
 canbus* can::GetBus(int busnumber)

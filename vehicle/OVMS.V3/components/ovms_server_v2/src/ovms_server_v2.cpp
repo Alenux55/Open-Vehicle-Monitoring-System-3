@@ -2165,7 +2165,7 @@ void OvmsServerV2::Ticker1(std::string event, void* data)
         ESP_LOGW(TAG, "Detected stale connection (issue #241), restarting network");
         SetStatus("Restarting network", false, WaitNetwork);
         Disconnect();
-        MyNetManager.RestartNetwork();
+        MyNetManager.RestartNetwork("server-v2", "stale-connection-timeout");
         return;
         }
       }

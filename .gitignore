@@ -65,3 +65,6 @@ docs/build/
 .vscode/
 vehicle/OVMS.V3/components/ovms_webserver/assets/charts.js.gz
 *.gz
+
+# Local firmware builds, experiment results, and handoff documents
+/artifacts/
