@@ -62,6 +62,7 @@ static const char *TAG = "boot";
 #include "ovms_config.h"
 #include "metrics_standard.h"
 #include "string_writer.h"
+#include <stddef.h>
 #include <string.h>
 
 boot_data_t __attribute__((section(".rtc.noload"))) boot_data;
@@ -361,6 +362,38 @@ extern "C" {
 }
 #endif
 
+static bool BootDataValidateAndMigrate(bool& migrated)
+  {
+  migrated = false;
+  if (boot_data.crc == boot_data.calc_crc())
+    return true;
+
+  // ovms_diag_state_t v3 was the final boot_data_t member and occupied 376
+  // bytes. All retained boot/crash fields before it have unchanged offsets.
+  // Validate the exact legacy byte range before preserving that prefix.
+  const size_t legacy_size =
+    offsetof(boot_data_t, diag) + OVMS_DIAG_STATE_V3_SIZE;
+  static_assert(OVMS_DIAG_STATE_V3_SIZE < sizeof(ovms_diag_state_t),
+    "legacy diagnostic layout must be smaller than the current layout");
+  if (legacy_size >= sizeof(boot_data_t))
+    return false;
+
+  uint32_t legacy_crc = crc32_le(0,
+    reinterpret_cast<uint8_t*>(&boot_data) + sizeof(boot_data.crc),
+    legacy_size - sizeof(boot_data.crc));
+  if (boot_data.crc != legacy_crc)
+    return false;
+
+  // The retained boot/crash prefix is already in place. The v3 diagnostic
+  // suffix cannot be copied wholesale because v4 inserts fields before the
+  // allocation/network records, so reinitialize only that suffix.
+  memset(&boot_data.diag, 0, sizeof(boot_data.diag));
+  boot_data.diag.version = OVMS_DIAG_STATE_VERSION;
+  boot_data.crc = boot_data.calc_crc();
+  migrated = true;
+  return true;
+  }
+
 Boot::Boot()
   {
   ESP_LOGI(TAG, "Initialising BOOT (1100)");
@@ -378,7 +411,7 @@ Boot::Boot()
   m_resetreason = esp_reset_reason(); // Note: necessary to link reset_reason module
 
   memset(&ovms_diag_live, 0, sizeof(ovms_diag_live));
-  ovms_diag_live.version = 4;
+  ovms_diag_live.version = OVMS_DIAG_STATE_VERSION;
 
   if (cpu0 == POWERON_RESET)
     {
@@ -392,11 +425,14 @@ Boot::Boot()
     esp_sleep_wakeup_cause_t wakeup_cause = esp_sleep_get_wakeup_cause();
     ESP_LOGI(TAG, "Wakeup from deep sleep detected, wakeup cause %d", wakeup_cause);
 
-    if (boot_data.crc != boot_data.calc_crc())
+    bool migrated = false;
+    if (!BootDataValidateAndMigrate(migrated))
       {
       memset(&boot_data,0,sizeof(boot_data_t));
       ESP_LOGW(TAG, "Boot data corruption detected, data cleared");
       }
+    else if (migrated)
+      ESP_LOGI(TAG, "Migrated retained boot data from diagnostic layout v3");
 
     // There is currently only one deep sleep application: saving the 12V battery
     // from depletion. So we need to check if the voltage level is sufficient for
@@ -434,14 +470,19 @@ Boot::Boot()
       ESP_LOGW(TAG, "ADC not available, cannot check 12V level");
     #endif // CONFIG_OVMS_COMP_ADC
     }
-  else if (boot_data.crc != boot_data.calc_crc())
-    {
-    memset(&boot_data,0,sizeof(boot_data_t));
-    m_bootreason = BR_PowerOn;
-    ESP_LOGW(TAG, "Boot data corruption detected, data cleared");
-    }
   else
     {
+    bool migrated = false;
+    if (!BootDataValidateAndMigrate(migrated))
+      {
+      memset(&boot_data,0,sizeof(boot_data_t));
+      m_bootreason = BR_PowerOn;
+      ESP_LOGW(TAG, "Boot data corruption detected, data cleared");
+      }
+    else
+      {
+      if (migrated)
+        ESP_LOGI(TAG, "Migrated retained boot data from diagnostic layout v3");
     boot_data.boot_count++;
     ESP_LOGI(TAG, "Boot #%d reasons for CPU0=%d and CPU1=%d",boot_data.boot_count,cpu0,cpu1);
 
@@ -485,6 +526,7 @@ Boot::Boot()
       ESP_LOGE(TAG, "Crash #%d detected", boot_data.crash_count_total);
       m_resetreason = boot_data.reset_hint;
       ESP_LOGI(TAG, "Reset reason %s (%d)", GetResetReasonName(), GetResetReason());
+      }
       }
     }
 

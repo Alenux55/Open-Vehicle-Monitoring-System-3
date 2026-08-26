@@ -84,20 +84,43 @@ static void VfsDiagUpdateMax(uint32_t* field, uint32_t value)
         __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {}
   }
 
-static void VfsDiagCaptureLifecycle(ovms_diag_vfs_lifecycle_stage_t stage)
+static bool VfsDiagTryLock(uint32_t* guard, uint32_t& stable)
+  {
+  stable = __atomic_load_n(guard, __ATOMIC_ACQUIRE);
+  for (int attempt = 0; attempt < 3; ++attempt)
+    {
+    if (stable & 1)
+      return false;
+    uint32_t updating = stable + 1;
+    if (__atomic_compare_exchange_n(guard, &stable, updating, true,
+          __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+      return true;
+    }
+  return false;
+  }
+
+static void VfsDiagCaptureLifecycle(ovms_diag_vfs_lifecycle_stage_t stage,
+  uint32_t lifecycle_sequence)
   {
   if (stage >= OVMS_DIAG_VFS_LIFECYCLE_COUNT)
     return;
 
-  ovms_diag_vfs_heap_stage_t& snapshot = ovms_diag_live.vfs_lifecycle[stage];
   const uint32_t caps = MALLOC_CAP_DMA | MALLOC_CAP_8BIT;
-  OvmsDiagStore(&snapshot.monotonic_ms, VfsDiagNowMs());
-  OvmsDiagStore(&snapshot.dma_free,
-    static_cast<uint32_t>(heap_caps_get_free_size(caps)));
-  OvmsDiagStore(&snapshot.dma_largest,
-    static_cast<uint32_t>(heap_caps_get_largest_free_block(caps)));
-  __atomic_store_n(&snapshot.sequence,
-    OvmsDiagLoad(&ovms_diag_live.vfs_lifecycle_sequence), __ATOMIC_RELEASE);
+  uint32_t monotonic_ms = VfsDiagNowMs();
+  uint32_t dma_free =
+    static_cast<uint32_t>(heap_caps_get_free_size(caps));
+  uint32_t dma_largest =
+    static_cast<uint32_t>(heap_caps_get_largest_free_block(caps));
+  ovms_diag_vfs_heap_stage_t& snapshot = ovms_diag_live.vfs_lifecycle[stage];
+  uint32_t stable;
+  if (!VfsDiagTryLock(&snapshot.sequence, stable))
+    return;
+
+  OvmsDiagStore(&snapshot.monotonic_ms, monotonic_ms);
+  OvmsDiagStore(&snapshot.dma_free, dma_free);
+  OvmsDiagStore(&snapshot.dma_largest, dma_largest);
+  __atomic_store_n(&snapshot.sequence, lifecycle_sequence * 2,
+    __ATOMIC_RELEASE);
   OvmsDiagStore(&ovms_diag_live.vfs_lifecycle_stage,
     static_cast<uint32_t>(stage));
   }
@@ -184,32 +207,8 @@ static void VfsDiagReset()
   OvmsDiagStore(&ovms_diag_live.vfs_owner_after_free, 0);
   OvmsDiagStore(&ovms_diag_live.vfs_owner_after_largest, 0);
   OvmsDiagStore(&ovms_diag_live.vfs_owner_result, OVMS_DIAG_VFS_OWNER_NONE);
-  OvmsDiagStore(&ovms_diag_live.vfs_lifecycle_stage,
-    OVMS_DIAG_VFS_LIFECYCLE_OPEN_BASELINE);
-  for (size_t i = 0; i < OVMS_DIAG_VFS_LIFECYCLE_COUNT; ++i)
-    {
-    OvmsDiagStore(&ovms_diag_live.vfs_lifecycle[i].sequence, 0);
-    OvmsDiagStore(&ovms_diag_live.vfs_lifecycle[i].monotonic_ms, 0);
-    OvmsDiagStore(&ovms_diag_live.vfs_lifecycle[i].dma_free, 0);
-    OvmsDiagStore(&ovms_diag_live.vfs_lifecycle[i].dma_largest, 0);
-    }
   OvmsDiagStore(&ovms_diag_live.vfs_slow_write_threshold_us,
     CANLOG_VFS_SLOW_WRITE_THRESHOLD_US);
-  OvmsDiagStore(&ovms_diag_live.vfs_slow_write_sequence, 0);
-  OvmsDiagStore(&ovms_diag_live.vfs_slow_write_requested, 0);
-  OvmsDiagStore(&ovms_diag_live.vfs_slow_write_accepted, 0);
-  OvmsDiagStore(&ovms_diag_live.vfs_slow_write_file_offset, 0);
-  OvmsDiagStore(&ovms_diag_live.vfs_slow_write_cluster_offset, 0);
-  OvmsDiagStore(&ovms_diag_live.vfs_slow_write_batch_used, 0);
-  OvmsDiagStore(&ovms_diag_live.vfs_slow_write_batch_capacity, 0);
-  OvmsDiagStore(&ovms_diag_live.vfs_slow_write_elapsed_us, 0);
-  OvmsDiagStore(&ovms_diag_live.vfs_slow_write_sync_due_ms, 0);
-  OvmsDiagStore(&ovms_diag_live.vfs_slow_write_sync_state, 0);
-  OvmsDiagStore(&ovms_diag_live.vfs_slow_write_primary_queued, 0);
-  OvmsDiagStore(&ovms_diag_live.vfs_slow_write_overflow_queued, 0);
-  OvmsDiagStore(&ovms_diag_live.vfs_slow_write_error_state, 0);
-  OvmsDiagStore(&ovms_diag_live.vfs_slow_write_errno, 0);
-  OvmsDiagStore(&ovms_diag_live.vfs_slow_write_ferror, 0);
   OvmsDiagStore(&ovms_diag_live.vfs_fflush_last_us, 0);
   OvmsDiagStore(&ovms_diag_live.vfs_fflush_max_us, 0);
   OvmsDiagStore(&ovms_diag_live.vfs_fflush_result, 0);
@@ -556,17 +555,31 @@ bool canlog_vfs_conn::WriteFileBytes(const char* data, size_t length, size_t& ac
     if (elapsed >= CANLOG_VFS_SLOW_WRITE_THRESHOLD_US)
       {
       canlog_vfs* logger = static_cast<canlog_vfs*>(m_logger);
-      uint32_t now_ms = VfsDiagNowMs();
-      uint32_t deadline_ms = logger->m_sync_deadline_ms.load(
-        std::memory_order_relaxed);
-      int32_t until_due = static_cast<int32_t>(deadline_ms - now_ms);
       uint32_t sync_state = 0;
+      uint32_t sync_due_ms = 0;
       if (m_dirty)
         sync_state |= OVMS_DIAG_VFS_SYNC_DIRTY;
       if (logger->m_syncperiod.load(std::memory_order_relaxed) > 0)
         sync_state |= OVMS_DIAG_VFS_SYNC_PERIODIC;
-      if (deadline_ms != 0 && until_due <= 0)
-        sync_state |= OVMS_DIAG_VFS_SYNC_DUE;
+      if (logger->m_sync_deadline > 0)
+        {
+        int64_t remaining_us =
+          logger->m_sync_deadline - esp_timer_get_time();
+        if (remaining_us <= 0)
+          sync_state |= OVMS_DIAG_VFS_SYNC_DUE;
+        else
+          {
+          uint64_t remaining_ms =
+            (static_cast<uint64_t>(remaining_us) + 999) / 1000;
+          if (remaining_ms > UINT32_MAX)
+            {
+            sync_due_ms = UINT32_MAX;
+            sync_state |= OVMS_DIAG_VFS_SYNC_DUE_CLAMPED;
+            }
+          else
+            sync_due_ms = static_cast<uint32_t>(remaining_ms);
+          }
+        }
       if (m_sync_in_progress.load(std::memory_order_relaxed))
         sync_state |= OVMS_DIAG_VFS_SYNC_RUNNING;
 
@@ -577,9 +590,16 @@ bool canlog_vfs_conn::WriteFileBytes(const char* data, size_t length, size_t& ac
         error_state |= OVMS_DIAG_VFS_WRITE_ERRNO;
       if (write_ferror != 0)
         error_state |= OVMS_DIAG_VFS_WRITE_FERROR;
-      if (logger->HasStorageError())
+      if (fatal || logger->HasStorageError())
         error_state |= OVMS_DIAG_VFS_WRITE_STORAGE;
 
+      uint32_t primary_queued =
+        logger->m_queue ? uxQueueMessagesWaiting(logger->m_queue) : 0;
+      uint32_t overflow_queued = VfsDiagToUint32(
+        logger->m_overflow_occupancy.load(std::memory_order_relaxed));
+      uint32_t stable;
+      if (VfsDiagTryLock(&ovms_diag_live.vfs_slow_write_sequence, stable))
+        {
       OvmsDiagStore(&ovms_diag_live.vfs_slow_write_requested,
         VfsDiagToUint32(requested));
       OvmsDiagStore(&ovms_diag_live.vfs_slow_write_accepted,
@@ -595,18 +615,18 @@ bool canlog_vfs_conn::WriteFileBytes(const char* data, size_t length, size_t& ac
       OvmsDiagStore(&ovms_diag_live.vfs_slow_write_elapsed_us,
         VfsDiagToUint32(elapsed));
       OvmsDiagStore(&ovms_diag_live.vfs_slow_write_sync_due_ms,
-        deadline_ms != 0 && until_due > 0 ? static_cast<uint32_t>(until_due) : 0);
+        sync_due_ms);
       OvmsDiagStore(&ovms_diag_live.vfs_slow_write_sync_state, sync_state);
       OvmsDiagStore(&ovms_diag_live.vfs_slow_write_primary_queued,
-        logger->m_queue ? uxQueueMessagesWaiting(logger->m_queue) : 0);
+        primary_queued);
       OvmsDiagStore(&ovms_diag_live.vfs_slow_write_overflow_queued,
-        VfsDiagToUint32(logger->m_overflow_occupancy.load(
-          std::memory_order_relaxed)));
+        overflow_queued);
       OvmsDiagStore(&ovms_diag_live.vfs_slow_write_error_state, error_state);
       OvmsDiagStore(&ovms_diag_live.vfs_slow_write_errno, write_errno);
       OvmsDiagStore(&ovms_diag_live.vfs_slow_write_ferror, write_ferror);
-      __atomic_add_fetch(&ovms_diag_live.vfs_slow_write_sequence, 1,
+      __atomic_store_n(&ovms_diag_live.vfs_slow_write_sequence, stable + 2,
         __ATOMIC_RELEASE);
+        }
       }
 
     if (written > 0)
@@ -834,7 +854,8 @@ bool canlog_vfs_conn::CloseFileStorageError()
 
 canlog_vfs::canlog_vfs(std::string path, std::string format)
   : canlog("vfs", format, canformat::Discard, false), m_vfs_conn(NULL),
-    m_syncperiod(0), m_batch_capacity_config(0), m_sync_deadline_ms(0),
+    m_syncperiod(0), m_batch_capacity_config(0), m_sync_deadline(0),
+    m_diag_lifecycle_sequence(0),
     m_storage_error_reason(CANLOG_VFS_STORAGE_ERROR_NONE),
     m_accepting(false), m_producers(0),
     m_queue_size(0), m_primary_highwater(0),
@@ -856,7 +877,8 @@ canlog_vfs::~canlog_vfs()
   {
   MyEvents.DeregisterEvent(IDTAG);
   Close();
-  VfsDiagCaptureLifecycle(OVMS_DIAG_VFS_LIFECYCLE_DESTRUCTION);
+  VfsDiagCaptureLifecycle(OVMS_DIAG_VFS_LIFECYCLE_DESTRUCTION,
+    m_diag_lifecycle_sequence);
   }
 
 void canlog_vfs::VfsTaskEntry(void* context)
@@ -868,7 +890,7 @@ void canlog_vfs::VfsTask()
   {
   int syncperiod = m_syncperiod.load();
   int64_t sync_deadline = 0;
-  m_sync_deadline_ms.store(0, std::memory_order_relaxed);
+  m_sync_deadline = 0;
   m_task_ready.Give();
   OvmsDiagStore(&ovms_diag_live.vfs_active, 1);
   OvmsDiagStore(&ovms_diag_live.vfs_op, OVMS_DIAG_VFS_IDLE);
@@ -966,7 +988,7 @@ void canlog_vfs::VfsTask()
 
   OvmsDiagStore(&ovms_diag_live.vfs_active, 0);
   OvmsDiagStore(&ovms_diag_live.vfs_op, OVMS_DIAG_VFS_IDLE);
-  m_sync_deadline_ms.store(0, std::memory_order_relaxed);
+  m_sync_deadline = 0;
   vTaskDelete(NULL);
   }
 
@@ -1018,16 +1040,14 @@ bool canlog_vfs::ProcessQueueItem(canlog_vfs_queue_msg_t& item,
         if (!was_dirty && m_vfs_conn->m_dirty && syncperiod > 0)
           {
           sync_deadline = esp_timer_get_time() + (int64_t)syncperiod * 1000000;
-          m_sync_deadline_ms.store(
-            static_cast<uint32_t>(sync_deadline / 1000),
-            std::memory_order_relaxed);
+          m_sync_deadline = sync_deadline;
           }
 
         if (syncperiod == -1 && m_vfs_conn->m_dirty)
           {
           m_vfs_conn->Sync();
           sync_deadline = 0;
-          m_sync_deadline_ms.store(0, std::memory_order_relaxed);
+          m_sync_deadline = 0;
           }
         }
       else
@@ -1046,8 +1066,7 @@ bool canlog_vfs::ProcessQueueItem(canlog_vfs_queue_msg_t& item,
       if (m_vfs_conn && m_vfs_conn->m_dirty && syncperiod > 0)
         {
         sync_deadline = esp_timer_get_time() + (int64_t)syncperiod * 1000000;
-        m_sync_deadline_ms.store(static_cast<uint32_t>(sync_deadline / 1000),
-          std::memory_order_relaxed);
+        m_sync_deadline = sync_deadline;
         }
       item.data.control.ack->Give();
       break;
@@ -1060,18 +1079,17 @@ bool canlog_vfs::ProcessQueueItem(canlog_vfs_queue_msg_t& item,
           {
           m_vfs_conn->Sync();
           sync_deadline = 0;
-          m_sync_deadline_ms.store(0, std::memory_order_relaxed);
+          m_sync_deadline = 0;
           }
         else if (syncperiod > 0)
           {
           sync_deadline = esp_timer_get_time() + (int64_t)syncperiod * 1000000;
-          m_sync_deadline_ms.store(static_cast<uint32_t>(sync_deadline / 1000),
-            std::memory_order_relaxed);
+          m_sync_deadline = sync_deadline;
           }
         else
           {
           sync_deadline = 0;
-          m_sync_deadline_ms.store(0, std::memory_order_relaxed);
+          m_sync_deadline = 0;
           }
         }
       break;
@@ -1095,9 +1113,7 @@ void canlog_vfs::CheckSyncDeadline(int syncperiod, int64_t& sync_deadline)
     sync_deadline = m_vfs_conn->m_dirty
       ? esp_timer_get_time() + (int64_t)syncperiod * 1000000
       : 0;
-    m_sync_deadline_ms.store(sync_deadline > 0
-      ? static_cast<uint32_t>(sync_deadline / 1000) : 0,
-      std::memory_order_relaxed);
+    m_sync_deadline = sync_deadline;
     }
   }
 
@@ -1195,7 +1211,8 @@ bool canlog_vfs::StartVfsTask(size_t primary_size, size_t overflow_size)
     static_cast<uint32_t>(heap_caps_get_free_size(stage_caps)));
   OvmsDiagStore(&ovms_diag_live.vfs_queues_ready_largest,
     static_cast<uint32_t>(heap_caps_get_largest_free_block(stage_caps)));
-  VfsDiagCaptureLifecycle(OVMS_DIAG_VFS_LIFECYCLE_QUEUES_READY);
+  VfsDiagCaptureLifecycle(OVMS_DIAG_VFS_LIFECYCLE_QUEUES_READY,
+    m_diag_lifecycle_sequence);
   BaseType_t result = xTaskCreatePinnedToCore(VfsTaskEntry, "OVMS CanLogVFS", 4096, (void*)this,
     CANLOG_VFS_TASK_PRIORITY, &m_task, CORE(1));
   if (result != pdPASS)
@@ -1288,7 +1305,8 @@ bool canlog_vfs::OpenFile()
     }
   conn->m_stdio_buffer_size = 0;
   conn->m_stdio_buffer_set = true;
-  VfsDiagCaptureLifecycle(OVMS_DIAG_VFS_LIFECYCLE_FOPEN_READY);
+  VfsDiagCaptureLifecycle(OVMS_DIAG_VFS_LIFECYCLE_FOPEN_READY,
+    m_diag_lifecycle_sequence);
 
   const uint32_t owner_caps = MALLOC_CAP_DMA | MALLOC_CAP_8BIT;
   OvmsDiagIncrement(&ovms_diag_live.vfs_owner_sequence);
@@ -1327,7 +1345,8 @@ bool canlog_vfs::OpenFile()
   conn->m_batch_capacity = batch_size;
   conn->m_batch_limit.store(batch_size);
   conn->m_batch_used.store(0);
-  VfsDiagCaptureLifecycle(OVMS_DIAG_VFS_LIFECYCLE_OWNER_READY);
+  VfsDiagCaptureLifecycle(OVMS_DIAG_VFS_LIFECYCLE_OWNER_READY,
+    m_diag_lifecycle_sequence);
 
   size_t direct_size = m_formatter->getbuffersize();
   if (direct_size > 0)
@@ -1800,8 +1819,10 @@ bool canlog_vfs::Open()
     CloseLocked();
 
   VfsDiagReset();
-  OvmsDiagIncrement(&ovms_diag_live.vfs_lifecycle_sequence);
-  VfsDiagCaptureLifecycle(OVMS_DIAG_VFS_LIFECYCLE_OPEN_BASELINE);
+  m_diag_lifecycle_sequence =
+    OvmsDiagIncrement(&ovms_diag_live.vfs_lifecycle_sequence);
+  VfsDiagCaptureLifecycle(OVMS_DIAG_VFS_LIFECYCLE_OPEN_BASELINE,
+    m_diag_lifecycle_sequence);
   m_storage_error_reason.store(CANLOG_VFS_STORAGE_ERROR_NONE,
     std::memory_order_release);
 
@@ -1833,7 +1854,8 @@ bool canlog_vfs::Open()
     static_cast<uint32_t>(heap_caps_get_free_size(stage_caps)));
   OvmsDiagStore(&ovms_diag_live.vfs_task_ready_largest,
     static_cast<uint32_t>(heap_caps_get_largest_free_block(stage_caps)));
-  VfsDiagCaptureLifecycle(OVMS_DIAG_VFS_LIFECYCLE_TASK_READY);
+  VfsDiagCaptureLifecycle(OVMS_DIAG_VFS_LIFECYCLE_TASK_READY,
+    m_diag_lifecycle_sequence);
   if (!QueueControl(item))
     {
     StopVfsTask();
@@ -1853,7 +1875,8 @@ bool canlog_vfs::Open()
 
   m_isopen = true;
   m_accepting.store(true, std::memory_order_release);
-  VfsDiagCaptureLifecycle(OVMS_DIAG_VFS_LIFECYCLE_FULLY_OPEN);
+  VfsDiagCaptureLifecycle(OVMS_DIAG_VFS_LIFECYCLE_FULLY_OPEN,
+    m_diag_lifecycle_sequence);
   ESP_LOGI(TAG, "Now logging CAN messages to '%s'", m_path.c_str());
   return true;
   }
@@ -1868,7 +1891,8 @@ void canlog_vfs::CloseLocked()
   {
   bool had_resources = m_queue || m_task || m_vfs_conn;
   if (had_resources)
-    VfsDiagCaptureLifecycle(OVMS_DIAG_VFS_LIFECYCLE_PRE_CLOSE);
+    VfsDiagCaptureLifecycle(OVMS_DIAG_VFS_LIFECYCLE_PRE_CLOSE,
+      m_diag_lifecycle_sequence);
   m_accepting.store(false, std::memory_order_release);
   m_isopen = false;
 
@@ -1888,14 +1912,16 @@ void canlog_vfs::CloseLocked()
   m_vfs_conn = NULL;
   }
   if (had_resources)
-    VfsDiagCaptureLifecycle(OVMS_DIAG_VFS_LIFECYCLE_POST_CLOSE_FREE);
+    VfsDiagCaptureLifecycle(OVMS_DIAG_VFS_LIFECYCLE_POST_CLOSE_FREE,
+      m_diag_lifecycle_sequence);
 
   DrainQueue();
   DestroyVfsQueue();
   m_task = NULL;
-  m_sync_deadline_ms.store(0, std::memory_order_relaxed);
+  m_sync_deadline = 0;
   if (had_resources)
-    VfsDiagCaptureLifecycle(OVMS_DIAG_VFS_LIFECYCLE_POST_STOP);
+    VfsDiagCaptureLifecycle(OVMS_DIAG_VFS_LIFECYCLE_POST_STOP,
+      m_diag_lifecycle_sequence);
   }
 
 void canlog_vfs::LogFrame(canbus* bus, CAN_log_type_t type, const CAN_frame_t* frame)

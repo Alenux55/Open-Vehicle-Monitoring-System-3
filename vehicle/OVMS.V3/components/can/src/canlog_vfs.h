@@ -243,7 +243,8 @@ class canlog_vfs : public canlog
     canlog_vfs_conn*    m_vfs_conn;
     std::atomic<int>    m_syncperiod;
     std::atomic<size_t> m_batch_capacity_config;
-    std::atomic<uint32_t> m_sync_deadline_ms;
+    int64_t             m_sync_deadline;
+    uint32_t            m_diag_lifecycle_sequence;
     std::atomic<int>    m_storage_error_reason;
     std::atomic<bool>   m_accepting;
     std::atomic<uint32_t> m_producers;

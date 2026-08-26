@@ -316,32 +316,37 @@ void can_log_health(int verbosity, OvmsWriter* writer, OvmsCommand* cmd, int arg
     OvmsDiagLoad(&ovms_diag_live.vfs_lifecycle_stage));
   for (size_t i = 0; i < OVMS_DIAG_VFS_LIFECYCLE_COUNT; ++i)
     {
-    const ovms_diag_vfs_heap_stage_t& stage = ovms_diag_live.vfs_lifecycle[i];
+    ovms_diag_vfs_heap_stage_t stage;
+    bool stage_valid = OvmsDiagReadVfsHeapStage(
+      ovms_diag_live.vfs_lifecycle[i], stage);
     can_log_health_line(writer,
       "vfs_heap stage:%s seq:%u ms:%u dma_free:%u dma_largest:%u\n",
       can_log_vfs_lifecycle_names[i],
-      __atomic_load_n(&stage.sequence, __ATOMIC_ACQUIRE),
-      OvmsDiagLoad(&stage.monotonic_ms), OvmsDiagLoad(&stage.dma_free),
-      OvmsDiagLoad(&stage.dma_largest));
+      stage_valid ? stage.sequence : 0U,
+      stage_valid ? stage.monotonic_ms : 0U,
+      stage_valid ? stage.dma_free : 0U,
+      stage_valid ? stage.dma_largest : 0U);
     }
+  ovms_diag_vfs_slow_write_snapshot_t slow_write;
+  bool slow_write_valid = OvmsDiagReadVfsSlowWrite(ovms_diag_live, slow_write);
   can_log_health_line(writer,
     "slow_write threshold_us:%u seq:%u requested:%u accepted:%u file_offset:%u cluster_offset:%u batch_used:%u batch_capacity:%u elapsed_us:%u sync_due_ms:%u sync_state:%u primary:%u overflow:%u error:%u errno:%d ferror:%d\n",
     OvmsDiagLoad(&ovms_diag_live.vfs_slow_write_threshold_us),
-    __atomic_load_n(&ovms_diag_live.vfs_slow_write_sequence, __ATOMIC_ACQUIRE),
-    OvmsDiagLoad(&ovms_diag_live.vfs_slow_write_requested),
-    OvmsDiagLoad(&ovms_diag_live.vfs_slow_write_accepted),
-    OvmsDiagLoad(&ovms_diag_live.vfs_slow_write_file_offset),
-    OvmsDiagLoad(&ovms_diag_live.vfs_slow_write_cluster_offset),
-    OvmsDiagLoad(&ovms_diag_live.vfs_slow_write_batch_used),
-    OvmsDiagLoad(&ovms_diag_live.vfs_slow_write_batch_capacity),
-    OvmsDiagLoad(&ovms_diag_live.vfs_slow_write_elapsed_us),
-    OvmsDiagLoad(&ovms_diag_live.vfs_slow_write_sync_due_ms),
-    OvmsDiagLoad(&ovms_diag_live.vfs_slow_write_sync_state),
-    OvmsDiagLoad(&ovms_diag_live.vfs_slow_write_primary_queued),
-    OvmsDiagLoad(&ovms_diag_live.vfs_slow_write_overflow_queued),
-    OvmsDiagLoad(&ovms_diag_live.vfs_slow_write_error_state),
-    OvmsDiagLoad(&ovms_diag_live.vfs_slow_write_errno),
-    OvmsDiagLoad(&ovms_diag_live.vfs_slow_write_ferror));
+    slow_write_valid ? slow_write.sequence : 0U,
+    slow_write_valid ? slow_write.requested : 0U,
+    slow_write_valid ? slow_write.accepted : 0U,
+    slow_write_valid ? slow_write.file_offset : 0U,
+    slow_write_valid ? slow_write.cluster_offset : 0U,
+    slow_write_valid ? slow_write.batch_used : 0U,
+    slow_write_valid ? slow_write.batch_capacity : 0U,
+    slow_write_valid ? slow_write.elapsed_us : 0U,
+    slow_write_valid ? slow_write.sync_due_ms : 0U,
+    slow_write_valid ? slow_write.sync_state : 0U,
+    slow_write_valid ? slow_write.primary_queued : 0U,
+    slow_write_valid ? slow_write.overflow_queued : 0U,
+    slow_write_valid ? slow_write.error_state : 0U,
+    slow_write_valid ? slow_write.error_no : 0,
+    slow_write_valid ? slow_write.file_error : 0);
   can_log_health_line(writer,
     "sync_io fflush_last_us:%u fflush_max_us:%u fflush_result:%d fsync_last_us:%u fsync_max_us:%u fsync_result:%d\n",
     OvmsDiagLoad(&ovms_diag_live.vfs_fflush_last_us),
@@ -450,23 +455,37 @@ void can_log_health(int verbosity, OvmsWriter* writer, OvmsCommand* cmd, int arg
   for (size_t i = 0; i < OVMS_DIAG_VFS_LIFECYCLE_COUNT; ++i)
     {
     const ovms_diag_vfs_heap_stage_t& stage = prior.vfs_lifecycle[i];
+    uint32_t encoded = stage.sequence;
+    uint32_t decoded = (encoded & 1) ? 0 : encoded / 2;
     can_log_health_line(writer,
       "previous_vfs_heap valid:%u stage:%s seq:%u ms:%u dma_free:%u dma_largest:%u\n",
-      previous_valid, can_log_vfs_lifecycle_names[i], stage.sequence,
-      stage.monotonic_ms, stage.dma_free, stage.dma_largest);
+      previous_valid, can_log_vfs_lifecycle_names[i],
+      previous_valid ? decoded : 0U,
+      previous_valid ? stage.monotonic_ms : 0U,
+      previous_valid ? stage.dma_free : 0U,
+      previous_valid ? stage.dma_largest : 0U);
     }
+  uint32_t previous_slow_encoded = prior.vfs_slow_write_sequence;
+  uint32_t previous_slow_seq =
+    (previous_slow_encoded & 1) ? 0 : previous_slow_encoded / 2;
   can_log_health_line(writer,
     "previous_slow_write valid:%u threshold_us:%u seq:%u requested:%u accepted:%u file_offset:%u cluster_offset:%u batch_used:%u batch_capacity:%u elapsed_us:%u sync_due_ms:%u sync_state:%u primary:%u overflow:%u error:%u errno:%d ferror:%d\n",
     previous_valid, prior.vfs_slow_write_threshold_us,
-    prior.vfs_slow_write_sequence, prior.vfs_slow_write_requested,
-    prior.vfs_slow_write_accepted, prior.vfs_slow_write_file_offset,
-    prior.vfs_slow_write_cluster_offset, prior.vfs_slow_write_batch_used,
-    prior.vfs_slow_write_batch_capacity, prior.vfs_slow_write_elapsed_us,
-    prior.vfs_slow_write_sync_due_ms, prior.vfs_slow_write_sync_state,
-    prior.vfs_slow_write_primary_queued,
-    prior.vfs_slow_write_overflow_queued,
-    prior.vfs_slow_write_error_state, prior.vfs_slow_write_errno,
-    prior.vfs_slow_write_ferror);
+    previous_valid ? previous_slow_seq : 0U,
+    previous_valid ? prior.vfs_slow_write_requested : 0U,
+    previous_valid ? prior.vfs_slow_write_accepted : 0U,
+    previous_valid ? prior.vfs_slow_write_file_offset : 0U,
+    previous_valid ? prior.vfs_slow_write_cluster_offset : 0U,
+    previous_valid ? prior.vfs_slow_write_batch_used : 0U,
+    previous_valid ? prior.vfs_slow_write_batch_capacity : 0U,
+    previous_valid ? prior.vfs_slow_write_elapsed_us : 0U,
+    previous_valid ? prior.vfs_slow_write_sync_due_ms : 0U,
+    previous_valid ? prior.vfs_slow_write_sync_state : 0U,
+    previous_valid ? prior.vfs_slow_write_primary_queued : 0U,
+    previous_valid ? prior.vfs_slow_write_overflow_queued : 0U,
+    previous_valid ? prior.vfs_slow_write_error_state : 0U,
+    previous_valid ? prior.vfs_slow_write_errno : 0,
+    previous_valid ? prior.vfs_slow_write_ferror : 0);
   can_log_health_line(writer,
     "previous_sync_io valid:%u fflush_last_us:%u fflush_max_us:%u fflush_result:%d fsync_last_us:%u fsync_max_us:%u fsync_result:%d\n",
     previous_valid, prior.vfs_fflush_last_us, prior.vfs_fflush_max_us,

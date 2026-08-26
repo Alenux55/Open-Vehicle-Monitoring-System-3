@@ -32,6 +32,7 @@
 #define __OVMS_BOOT_H__
 
 #include <string>
+#include <string.h>
 
 #include "rom/rtc.h"
 #include "rom/crc.h"
@@ -84,6 +85,9 @@ typedef struct
 // investigation. The live copy stays in normal DRAM; the panic handler copies
 // it to boot_data once, so hot paths never write RTC slow memory or update the
 // boot-data CRC.
+static const uint32_t OVMS_DIAG_STATE_VERSION = 4;
+static const size_t OVMS_DIAG_STATE_V3_SIZE = 376;
+
 enum ovms_diag_synth_state_t : uint32_t
   {
   OVMS_DIAG_SYNTH_NEVER = 0,
@@ -132,6 +136,7 @@ enum ovms_diag_vfs_sync_state_t : uint32_t
   OVMS_DIAG_VFS_SYNC_PERIODIC = 1 << 1,
   OVMS_DIAG_VFS_SYNC_DUE = 1 << 2,
   OVMS_DIAG_VFS_SYNC_RUNNING = 1 << 3,
+  OVMS_DIAG_VFS_SYNC_DUE_CLAMPED = 1 << 4,
   };
 
 enum ovms_diag_vfs_write_error_t : uint32_t
@@ -144,12 +149,31 @@ enum ovms_diag_vfs_write_error_t : uint32_t
 
 typedef struct
   {
-  // sequence is published last and identifies the open/close cycle.
+  // Encoded seqlock: odd means updating, stable value / 2 is the open cycle.
   uint32_t sequence;
   uint32_t monotonic_ms;
   uint32_t dma_free;
   uint32_t dma_largest;
   } ovms_diag_vfs_heap_stage_t;
+
+typedef struct
+  {
+  uint32_t sequence;
+  uint32_t requested;
+  uint32_t accepted;
+  uint32_t file_offset;
+  uint32_t cluster_offset;
+  uint32_t batch_used;
+  uint32_t batch_capacity;
+  uint32_t elapsed_us;
+  uint32_t sync_due_ms;
+  uint32_t sync_state;
+  uint32_t primary_queued;
+  uint32_t overflow_queued;
+  uint32_t error_state;
+  int32_t error_no;
+  int32_t file_error;
+  } ovms_diag_vfs_slow_write_snapshot_t;
 
 typedef struct
   {
@@ -290,6 +314,69 @@ inline void OvmsDiagStore(int32_t* field, int32_t value)
   { __atomic_store_n(field, value, __ATOMIC_RELAXED); }
 inline uint32_t OvmsDiagIncrement(uint32_t* field)
   { return __atomic_add_fetch(field, 1, __ATOMIC_RELAXED); }
+
+inline bool OvmsDiagReadVfsHeapStage(
+  const ovms_diag_vfs_heap_stage_t& source,
+  ovms_diag_vfs_heap_stage_t& snapshot)
+  {
+  memset(&snapshot, 0, sizeof(snapshot));
+  for (int attempt = 0; attempt < 3; ++attempt)
+    {
+    uint32_t before = __atomic_load_n(&source.sequence, __ATOMIC_ACQUIRE);
+    if (before & 1)
+      continue;
+    snapshot.monotonic_ms = OvmsDiagLoad(&source.monotonic_ms);
+    snapshot.dma_free = OvmsDiagLoad(&source.dma_free);
+    snapshot.dma_largest = OvmsDiagLoad(&source.dma_largest);
+    uint32_t after = __atomic_load_n(&source.sequence, __ATOMIC_ACQUIRE);
+    if (before == after && !(after & 1))
+      {
+      snapshot.sequence = after / 2;
+      return after != 0;
+      }
+    }
+  return false;
+  }
+
+inline bool OvmsDiagReadVfsSlowWrite(
+  const ovms_diag_state_t& source,
+  ovms_diag_vfs_slow_write_snapshot_t& snapshot)
+  {
+  memset(&snapshot, 0, sizeof(snapshot));
+  for (int attempt = 0; attempt < 3; ++attempt)
+    {
+    uint32_t before = __atomic_load_n(
+      &source.vfs_slow_write_sequence, __ATOMIC_ACQUIRE);
+    if (before & 1)
+      continue;
+    snapshot.requested = OvmsDiagLoad(&source.vfs_slow_write_requested);
+    snapshot.accepted = OvmsDiagLoad(&source.vfs_slow_write_accepted);
+    snapshot.file_offset = OvmsDiagLoad(&source.vfs_slow_write_file_offset);
+    snapshot.cluster_offset =
+      OvmsDiagLoad(&source.vfs_slow_write_cluster_offset);
+    snapshot.batch_used = OvmsDiagLoad(&source.vfs_slow_write_batch_used);
+    snapshot.batch_capacity =
+      OvmsDiagLoad(&source.vfs_slow_write_batch_capacity);
+    snapshot.elapsed_us = OvmsDiagLoad(&source.vfs_slow_write_elapsed_us);
+    snapshot.sync_due_ms = OvmsDiagLoad(&source.vfs_slow_write_sync_due_ms);
+    snapshot.sync_state = OvmsDiagLoad(&source.vfs_slow_write_sync_state);
+    snapshot.primary_queued =
+      OvmsDiagLoad(&source.vfs_slow_write_primary_queued);
+    snapshot.overflow_queued =
+      OvmsDiagLoad(&source.vfs_slow_write_overflow_queued);
+    snapshot.error_state = OvmsDiagLoad(&source.vfs_slow_write_error_state);
+    snapshot.error_no = OvmsDiagLoad(&source.vfs_slow_write_errno);
+    snapshot.file_error = OvmsDiagLoad(&source.vfs_slow_write_ferror);
+    uint32_t after = __atomic_load_n(
+      &source.vfs_slow_write_sequence, __ATOMIC_ACQUIRE);
+    if (before == after && !(after & 1))
+      {
+      snapshot.sequence = after / 2;
+      return after != 0;
+      }
+    }
+  return false;
+  }
 
 typedef struct
   {

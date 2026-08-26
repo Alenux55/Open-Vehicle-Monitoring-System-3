@@ -12,6 +12,7 @@ idf_build_get_property(prefix __PREFIX)
 target_linker_script("__${prefix}_esp_system" INTERFACE "${COMPONENT_DIR}/ovms_boot.ld")
 
 execute_process(COMMAND git describe --always --tags --dirty
+                WORKING_DIRECTORY "${COMPONENT_DIR}"
                 OUTPUT_VARIABLE OVMS_VERSION
                 ERROR_QUIET OUTPUT_STRIP_TRAILING_WHITESPACE)
 add_definitions("-DOVMS_VERSION=\"${OVMS_VERSION}\"")
