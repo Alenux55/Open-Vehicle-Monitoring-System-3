@@ -56,7 +56,21 @@ canformat_crtd::~canformat_crtd()
 
 std::string canformat_crtd::get(CAN_log_message_t* message)
   {
-  char buf[CANFORMAT_CRTD_MAXLEN];
+  char buf[CANFORMAT_CRTD_BUFFER_SIZE];
+  size_t length = get(message, buf, sizeof(buf));
+  return std::string(buf, length);
+  }
+
+size_t canformat_crtd::getbuffersize()
+  {
+  return CANFORMAT_CRTD_BUFFER_SIZE;
+  }
+
+size_t canformat_crtd::get(CAN_log_message_t* message, char* buf, size_t capacity)
+  {
+  if (!buf || capacity < CANFORMAT_CRTD_BUFFER_SIZE)
+    return 0;
+
   char *p;
 
   char busnumber;
@@ -69,7 +83,7 @@ std::string canformat_crtd::get(CAN_log_message_t* message)
     {
     case CAN_LogFrame_RX:
     case CAN_LogFrame_TX:
-      snprintf(buf,sizeof(buf),"%l" PRId32 ".%06ld %c%c%s %0*" PRIX32,
+      snprintf(buf,CANFORMAT_CRTD_MAXLEN,"%l" PRId32 ".%06ld %c%c%s %0*" PRIX32,
         message->timestamp.tv_sec, message->timestamp.tv_usec,
         busnumber,
         (message->type == CAN_LogFrame_RX) ? 'R' : 'T',
@@ -87,7 +101,7 @@ std::string canformat_crtd::get(CAN_log_message_t* message)
 
     case CAN_LogFrame_TX_Queue:
     case CAN_LogFrame_TX_Fail:
-      snprintf(buf,sizeof(buf),"%l" PRId32 ".%06ld %cCER %s %c%s %0*" PRIX32,
+      snprintf(buf,CANFORMAT_CRTD_MAXLEN,"%l" PRId32 ".%06ld %cCER %s %c%s %0*" PRIX32,
         message->timestamp.tv_sec, message->timestamp.tv_usec,
         busnumber,
         GetCanLogTypeName(message->type),
@@ -106,7 +120,7 @@ std::string canformat_crtd::get(CAN_log_message_t* message)
 
     case CAN_LogStatus_Error:
     case CAN_LogStatus_Statistics:
-      snprintf(buf,sizeof(buf),
+      snprintf(buf,CANFORMAT_CRTD_MAXLEN,
         "%l" PRId32 ".%06ld %c%s %s intr=%" PRId32 " rxpkt=%" PRId32 " txpkt=%" PRId32 " errflags=%#" PRIx32 " rxerr=%d txerr=%d"
         " rxinval=%d rxovr=%d txovr=%d txdelay=%" PRId32 " txfail=%" PRId32 " wdgreset=%d errreset=%d isrovr=%d txqueue=%" PRId32,
         message->timestamp.tv_sec, message->timestamp.tv_usec,
@@ -124,7 +138,7 @@ std::string canformat_crtd::get(CAN_log_message_t* message)
     case CAN_LogInfo_Config:
     case CAN_LogInfo_Event:
     case CAN_LogInfo_Metric:
-      snprintf(buf,sizeof(buf),"%l" PRId32 ".%06ld %c%s %s %s",
+      snprintf(buf,CANFORMAT_CRTD_MAXLEN,"%l" PRId32 ".%06ld %c%s %s %s",
         message->timestamp.tv_sec, message->timestamp.tv_usec,
         busnumber,
         (message->type == CAN_LogInfo_Event) ? "CEV" : (message->type == CAN_LogInfo_Metric) ? "CMT" : "CXX",
@@ -138,7 +152,7 @@ std::string canformat_crtd::get(CAN_log_message_t* message)
     }
 
   strcat(buf,"\n");
-  return std::string(buf);
+  return strlen(buf);
   }
 
 std::string canformat_crtd::getheader(struct timeval *time)

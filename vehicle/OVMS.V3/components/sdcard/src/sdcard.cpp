@@ -225,6 +225,19 @@ bool sdcard::isavailable()
   return m_mounted && !m_unmounting;
   }
 
+size_t sdcard::GetFatClusterSize()
+  {
+  if (!isavailable() || !m_card)
+    return 0;
+
+  FATFS* fs = NULL;
+  DWORD free_clusters = 0;
+  if (f_getfree("1:", &free_clusters, &fs) != FR_OK || !fs)
+    return 0;
+
+  return (size_t)fs->csize * m_card->csd.sector_size;
+  }
+
 bool sdcard::isunmounting()
   {
   return m_unmounting;

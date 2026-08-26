@@ -339,7 +339,7 @@ std::string canlogconnection::GetStats()
 // CAN Logger class
 ////////////////////////////////////////////////////////////////////////
 
-canlog::canlog(const char* type, std::string format, canformat::canformat_serve_mode_t mode)
+canlog::canlog(const char* type, std::string format, canformat::canformat_serve_mode_t mode, bool start_task)
   : m_events_filters(TAG), m_metrics_filters(TAG)
   {
   m_type = type;
@@ -361,10 +361,16 @@ canlog::canlog(const char* type, std::string format, canformat::canformat_serve_
   MyEvents.RegisterEvent(IDTAG,"config.changed", std::bind(&canlog::UpdatedConfig, this, _1, _2));
   MyMetrics.RegisterListener(IDTAG, "*", std::bind(&canlog::MetricListener, this, _1));
 
-  int queuesize = MyConfig.GetParamValueInt(CAN_PARAM, "log.queuesize",100);
+  m_task = NULL;
+  m_queue = NULL;
+
   LoadConfig();
-  m_queue = xQueueCreate(queuesize, sizeof(CAN_log_message_t));
-  xTaskCreatePinnedToCore(RxTask, "OVMS CanLog", 4096, (void*)this, 10, &m_task, CORE(1));
+  if (start_task)
+    {
+    int queuesize = MyConfig.GetParamValueInt(CAN_PARAM, "log.queuesize",100);
+    m_queue = xQueueCreate(queuesize, sizeof(CAN_log_message_t));
+    xTaskCreatePinnedToCore(RxTask, "OVMS CanLog", 4096, (void*)this, 10, &m_task, CORE(1));
+    }
   }
 
 canlog::~canlog()

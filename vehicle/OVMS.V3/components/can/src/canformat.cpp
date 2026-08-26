@@ -95,6 +95,16 @@ std::string canformat::get(CAN_log_message_t* message)
   return std::string("");
   }
 
+size_t canformat::getbuffersize()
+  {
+  return 0;
+  }
+
+size_t canformat::get(CAN_log_message_t* message, char* buffer, size_t capacity)
+  {
+  return 0;
+  }
+
 std::string canformat::getheader(struct timeval *time)
   {
   return std::string("");

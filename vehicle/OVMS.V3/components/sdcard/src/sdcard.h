@@ -54,6 +54,7 @@ class sdcard : public pcp, public InternalRamAllocated
     bool isunmounting();
     bool ismounted();
     bool isinserted();
+    size_t GetFatClusterSize();
 
   public:
     void Ticker1(std::string event, void* data);

@@ -55,6 +55,11 @@ class canformat
 
   public: // Conversion from OVMS CAN log messages to specific format
     virtual std::string get(CAN_log_message_t* message);
+    // Optional direct formatting interface. getbuffersize() returns the minimum
+    // caller buffer capacity including any trailing NUL, or zero if unsupported.
+    // get() returns the formatted byte count excluding the trailing NUL.
+    virtual size_t getbuffersize();
+    virtual size_t get(CAN_log_message_t* message, char* buffer, size_t capacity);
     virtual std::string getheader(struct timeval *time = NULL);
 
   public: // Conversion from specific format to OVMS CAN log messages

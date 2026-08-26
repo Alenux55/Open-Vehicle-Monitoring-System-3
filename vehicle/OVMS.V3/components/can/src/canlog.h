@@ -108,7 +108,8 @@ class canlog
 #endif
   {
   public:
-    canlog(const char* type, std::string format, canformat::canformat_serve_mode_t mode=canformat::Discard);
+    canlog(const char* type, std::string format, canformat::canformat_serve_mode_t mode=canformat::Discard,
+      bool start_task=true);
     virtual ~canlog();
 
   public:
