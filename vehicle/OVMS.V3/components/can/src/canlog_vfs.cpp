@@ -32,7 +32,6 @@ static const char *TAG = "canlog-vfs";
 #include "canlog_vfs.h"
 #include "ovms_utils.h"
 #include "ovms_config.h"
-#include "ovms_boot.h"
 #include "ovms_peripherals.h"
 #include "ovms_vfs.h"
 #include "esp_timer.h"
@@ -57,7 +56,6 @@ static const size_t CANLOG_VFS_BATCH_SIZE = 8192;
 static const size_t CANLOG_VFS_BATCH_SIZE_MIN = 4096;
 static const size_t CANLOG_VFS_BATCH_SIZE_MAX = 65536;
 static const size_t CANLOG_VFS_BATCH_SIZE_ALIGNMENT = 4096;
-static const uint32_t CANLOG_VFS_SLOW_WRITE_THRESHOLD_US = 5000;
 static const size_t CANLOG_VFS_PRIMARY_SIZE_DEFAULT = 100;
 static const size_t CANLOG_VFS_PRIMARY_SIZE_MIN = 32;
 static const size_t CANLOG_VFS_PRIMARY_SIZE_MAX = 128;
@@ -65,158 +63,6 @@ static const size_t CANLOG_VFS_OVERFLOW_SIZE_DEFAULT = 1280;
 static const size_t CANLOG_VFS_OVERFLOW_SIZE_MIN = 128;
 static const size_t CANLOG_VFS_OVERFLOW_SIZE_MAX = 8192;
 static const size_t CANLOG_VFS_OVERFLOW_SCRATCH_SIZE = 8;
-
-static uint32_t VfsDiagNowMs()
-  {
-  return static_cast<uint32_t>(esp_timer_get_time() / 1000);
-  }
-
-static uint32_t VfsDiagToUint32(uint64_t value)
-  {
-  return value > UINT32_MAX ? UINT32_MAX : static_cast<uint32_t>(value);
-  }
-
-static void VfsDiagUpdateMax(uint32_t* field, uint32_t value)
-  {
-  uint32_t current = OvmsDiagLoad(field);
-  while (value > current
-      && !__atomic_compare_exchange_n(field, &current, value, true,
-        __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {}
-  }
-
-static bool VfsDiagTryLock(uint32_t* guard, uint32_t& stable)
-  {
-  stable = __atomic_load_n(guard, __ATOMIC_ACQUIRE);
-  for (int attempt = 0; attempt < 3; ++attempt)
-    {
-    if (stable & 1)
-      return false;
-    uint32_t updating = stable + 1;
-    if (__atomic_compare_exchange_n(guard, &stable, updating, true,
-          __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
-      return true;
-    }
-  return false;
-  }
-
-static void VfsDiagCaptureLifecycle(ovms_diag_vfs_lifecycle_stage_t stage,
-  uint32_t lifecycle_sequence)
-  {
-  if (stage >= OVMS_DIAG_VFS_LIFECYCLE_COUNT)
-    return;
-
-  const uint32_t caps = MALLOC_CAP_DMA | MALLOC_CAP_8BIT;
-  uint32_t monotonic_ms = VfsDiagNowMs();
-  uint32_t dma_free =
-    static_cast<uint32_t>(heap_caps_get_free_size(caps));
-  uint32_t dma_largest =
-    static_cast<uint32_t>(heap_caps_get_largest_free_block(caps));
-  ovms_diag_vfs_heap_stage_t& snapshot = ovms_diag_live.vfs_lifecycle[stage];
-  uint32_t stable;
-  if (!VfsDiagTryLock(&snapshot.sequence, stable))
-    return;
-
-  OvmsDiagStore(&snapshot.monotonic_ms, monotonic_ms);
-  OvmsDiagStore(&snapshot.dma_free, dma_free);
-  OvmsDiagStore(&snapshot.dma_largest, dma_largest);
-  __atomic_store_n(&snapshot.sequence, lifecycle_sequence * 2,
-    __ATOMIC_RELEASE);
-  OvmsDiagStore(&ovms_diag_live.vfs_lifecycle_stage,
-    static_cast<uint32_t>(stage));
-  }
-
-static uint32_t VfsDiagBegin(ovms_diag_vfs_op_t operation)
-  {
-  uint32_t parent = OvmsDiagLoad(&ovms_diag_live.vfs_op);
-  OvmsDiagStore(&ovms_diag_live.vfs_parent_op, parent);
-  OvmsDiagIncrement(&ovms_diag_live.vfs_op_sequence);
-  OvmsDiagStore(&ovms_diag_live.vfs_op_started_ms, VfsDiagNowMs());
-  __atomic_store_n(&ovms_diag_live.vfs_op, static_cast<uint32_t>(operation),
-    __ATOMIC_RELEASE);
-  return parent;
-  }
-
-static void VfsDiagEnd(uint32_t parent)
-  {
-  OvmsDiagStore(&ovms_diag_live.vfs_op_completed_ms, VfsDiagNowMs());
-  __atomic_store_n(&ovms_diag_live.vfs_op, parent, __ATOMIC_RELEASE);
-  OvmsDiagStore(&ovms_diag_live.vfs_parent_op, OVMS_DIAG_VFS_IDLE);
-  }
-
-static void VfsDiagSampleHeap()
-  {
-  uint32_t now = VfsDiagNowMs();
-  uint32_t last = OvmsDiagLoad(&ovms_diag_live.heap_sample_ms);
-  if (now - last < 1000)
-    return;
-
-  OvmsDiagStore(&ovms_diag_live.heap_internal_free,
-    static_cast<uint32_t>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)));
-  OvmsDiagStore(&ovms_diag_live.heap_internal_largest,
-    static_cast<uint32_t>(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)));
-  OvmsDiagStore(&ovms_diag_live.heap_internal_minimum,
-    static_cast<uint32_t>(heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)));
-  OvmsDiagStore(&ovms_diag_live.heap_dma_free,
-    static_cast<uint32_t>(heap_caps_get_free_size(MALLOC_CAP_DMA | MALLOC_CAP_8BIT)));
-  OvmsDiagStore(&ovms_diag_live.heap_dma_largest,
-    static_cast<uint32_t>(heap_caps_get_largest_free_block(MALLOC_CAP_DMA | MALLOC_CAP_8BIT)));
-  OvmsDiagStore(&ovms_diag_live.heap_dma_minimum,
-    static_cast<uint32_t>(heap_caps_get_minimum_free_size(MALLOC_CAP_DMA | MALLOC_CAP_8BIT)));
-  OvmsDiagStore(&ovms_diag_live.heap_sample_ms, now);
-  }
-
-static void VfsDiagReset()
-  {
-  OvmsDiagStore(&ovms_diag_live.vfs_active, 0);
-  OvmsDiagStore(&ovms_diag_live.vfs_heartbeat, 0);
-  OvmsDiagStore(&ovms_diag_live.vfs_primary_enqueue, 0);
-  OvmsDiagStore(&ovms_diag_live.vfs_overflow_enqueue, 0);
-  OvmsDiagStore(&ovms_diag_live.vfs_overflow_drop, 0);
-  OvmsDiagStore(&ovms_diag_live.vfs_dequeue, 0);
-  OvmsDiagStore(&ovms_diag_live.vfs_format_complete, 0);
-  OvmsDiagStore(&ovms_diag_live.vfs_batch_start, 0);
-  OvmsDiagStore(&ovms_diag_live.vfs_batch_end, 0);
-  OvmsDiagStore(&ovms_diag_live.vfs_fwrite_start, 0);
-  OvmsDiagStore(&ovms_diag_live.vfs_fwrite_end, 0);
-  OvmsDiagStore(&ovms_diag_live.vfs_fflush_start, 0);
-  OvmsDiagStore(&ovms_diag_live.vfs_fflush_end, 0);
-  OvmsDiagStore(&ovms_diag_live.vfs_fsync_start, 0);
-  OvmsDiagStore(&ovms_diag_live.vfs_fsync_end, 0);
-  OvmsDiagStore(&ovms_diag_live.vfs_op, OVMS_DIAG_VFS_IDLE);
-  OvmsDiagStore(&ovms_diag_live.vfs_parent_op, OVMS_DIAG_VFS_IDLE);
-  OvmsDiagStore(&ovms_diag_live.vfs_op_sequence, 0);
-  OvmsDiagStore(&ovms_diag_live.vfs_op_started_ms, 0);
-  OvmsDiagStore(&ovms_diag_live.vfs_op_completed_ms, 0);
-  OvmsDiagStore(&ovms_diag_live.vfs_storage_error, 0);
-  OvmsDiagStore(&ovms_diag_live.heap_sample_ms, 0);
-  OvmsDiagStore(&ovms_diag_live.heap_internal_free, 0);
-  OvmsDiagStore(&ovms_diag_live.heap_internal_largest, 0);
-  OvmsDiagStore(&ovms_diag_live.heap_internal_minimum, 0);
-  OvmsDiagStore(&ovms_diag_live.heap_dma_free, 0);
-  OvmsDiagStore(&ovms_diag_live.heap_dma_largest, 0);
-  OvmsDiagStore(&ovms_diag_live.heap_dma_minimum, 0);
-  OvmsDiagStore(&ovms_diag_live.vfs_queues_ready_free, 0);
-  OvmsDiagStore(&ovms_diag_live.vfs_queues_ready_largest, 0);
-  OvmsDiagStore(&ovms_diag_live.vfs_task_ready_free, 0);
-  OvmsDiagStore(&ovms_diag_live.vfs_task_ready_largest, 0);
-  OvmsDiagStore(&ovms_diag_live.vfs_owner_requested, 0);
-  OvmsDiagStore(&ovms_diag_live.vfs_owner_caps, 0);
-  OvmsDiagStore(&ovms_diag_live.vfs_owner_attempt_ms, 0);
-  OvmsDiagStore(&ovms_diag_live.vfs_owner_before_free, 0);
-  OvmsDiagStore(&ovms_diag_live.vfs_owner_before_largest, 0);
-  OvmsDiagStore(&ovms_diag_live.vfs_owner_after_free, 0);
-  OvmsDiagStore(&ovms_diag_live.vfs_owner_after_largest, 0);
-  OvmsDiagStore(&ovms_diag_live.vfs_owner_result, OVMS_DIAG_VFS_OWNER_NONE);
-  OvmsDiagStore(&ovms_diag_live.vfs_slow_write_threshold_us,
-    CANLOG_VFS_SLOW_WRITE_THRESHOLD_US);
-  OvmsDiagStore(&ovms_diag_live.vfs_fflush_last_us, 0);
-  OvmsDiagStore(&ovms_diag_live.vfs_fflush_max_us, 0);
-  OvmsDiagStore(&ovms_diag_live.vfs_fflush_result, 0);
-  OvmsDiagStore(&ovms_diag_live.vfs_fsync_last_us, 0);
-  OvmsDiagStore(&ovms_diag_live.vfs_fsync_max_us, 0);
-  OvmsDiagStore(&ovms_diag_live.vfs_fsync_result, 0);
-  VfsDiagSampleHeap();
-  }
 
 static_assert(sizeof(canlog_vfs_queue_msg_t) == 72,
   "VFS CAN log queue item size changed; review queue and overflow memory budgets");
@@ -351,20 +197,14 @@ OvmsCanLogVFSInit::OvmsCanLogVFSInit()
 
 
 canlog_vfs_conn::canlog_vfs_conn(canlog* logger, std::string format, canformat::canformat_serve_mode_t mode)
-  : canlogconnection(logger, format, mode), m_file(NULL), m_stdio_buffer_size(0),
-    m_stdio_buffer_set(false), m_batch_buffer(NULL),
+  : canlogconnection(logger, format, mode), m_file(NULL), m_batch_buffer(NULL),
     m_batch_capacity(0), m_cluster_size(0), m_batch_limit(0), m_batch_used(0),
     m_format_buffer(NULL), m_format_buffer_size(0),
     m_write_blocked(false),
     m_write_errors(0), m_write_short(0), m_write_zero(0),
-    m_write_first_recorded(false), m_write_first_errno(0), m_write_first_ferror(0),
-    m_write_first_requested(0), m_write_first_returned(0),
-    m_write_first_duration_ms(0),
-    m_write_in_progress(false), m_write_in_progress_started_ms(0),
-    m_write_current_requested(0), m_file_size(0),
+    m_file_size(0),
     m_vfs_msgcount(0), m_vfs_dropcount(0), m_vfs_discardcount(0), m_vfs_filtercount(0),
-    m_sync_count(0), m_sync_errors(0), m_sync_time(0), m_dirty(false),
-    m_sync_in_progress(false)
+    m_sync_count(0), m_sync_errors(0), m_sync_time(0), m_dirty(false)
   {
   }
 
@@ -521,25 +361,12 @@ bool canlog_vfs_conn::WriteFileBytes(const char* data, size_t length, size_t& ac
   while (accepted < length)
     {
     size_t requested = length - accepted;
-    size_t file_offset = m_file_size.load(std::memory_order_relaxed);
-    size_t cluster_offset = m_cluster_size > 0
-      ? file_offset % m_cluster_size : 0;
-    size_t batch_used = m_batch_used.load(std::memory_order_relaxed);
-    size_t batch_capacity = m_batch_capacity;
     errno = 0;
     int64_t started = esp_timer_get_time();
-    m_write_current_requested.store(requested, std::memory_order_relaxed);
-    m_write_in_progress_started_ms.store(
-      static_cast<uint32_t>(started / 1000), std::memory_order_relaxed);
-    m_write_in_progress.store(true, std::memory_order_release);
-    uint32_t diag_parent = VfsDiagBegin(OVMS_DIAG_VFS_FWRITE);
-    OvmsDiagIncrement(&ovms_diag_live.vfs_fwrite_start);
     size_t written = fwrite(data + accepted, 1, requested, m_file);
-    OvmsDiagIncrement(&ovms_diag_live.vfs_fwrite_end);
-    VfsDiagEnd(diag_parent);
     int write_errno = errno;
     int write_ferror = ferror(m_file);
-    uint64_t elapsed = esp_timer_get_time() - started;
+    int64_t elapsed = esp_timer_get_time() - started;
     bool fatal = written < requested || write_errno != 0 || write_ferror != 0;
     if (written < requested)
       {
@@ -549,85 +376,6 @@ bool canlog_vfs_conn::WriteFileBytes(const char* data, size_t length, size_t& ac
       }
     if (fatal)
       m_write_errors.fetch_add(1, std::memory_order_relaxed);
-    m_write_in_progress.store(false, std::memory_order_release);
-    static_cast<canlog_vfs*>(m_logger)->RecordWriteTiming(elapsed, written);
-
-    if (elapsed >= CANLOG_VFS_SLOW_WRITE_THRESHOLD_US)
-      {
-      canlog_vfs* logger = static_cast<canlog_vfs*>(m_logger);
-      uint32_t sync_state = 0;
-      uint32_t sync_due_ms = 0;
-      if (m_dirty)
-        sync_state |= OVMS_DIAG_VFS_SYNC_DIRTY;
-      if (logger->m_syncperiod.load(std::memory_order_relaxed) > 0)
-        sync_state |= OVMS_DIAG_VFS_SYNC_PERIODIC;
-      if (logger->m_sync_deadline > 0)
-        {
-        int64_t remaining_us =
-          logger->m_sync_deadline - esp_timer_get_time();
-        if (remaining_us <= 0)
-          sync_state |= OVMS_DIAG_VFS_SYNC_DUE;
-        else
-          {
-          uint64_t remaining_ms =
-            (static_cast<uint64_t>(remaining_us) + 999) / 1000;
-          if (remaining_ms > UINT32_MAX)
-            {
-            sync_due_ms = UINT32_MAX;
-            sync_state |= OVMS_DIAG_VFS_SYNC_DUE_CLAMPED;
-            }
-          else
-            sync_due_ms = static_cast<uint32_t>(remaining_ms);
-          }
-        }
-      if (m_sync_in_progress.load(std::memory_order_relaxed))
-        sync_state |= OVMS_DIAG_VFS_SYNC_RUNNING;
-
-      uint32_t error_state = 0;
-      if (written < requested)
-        error_state |= OVMS_DIAG_VFS_WRITE_SHORT;
-      if (write_errno != 0)
-        error_state |= OVMS_DIAG_VFS_WRITE_ERRNO;
-      if (write_ferror != 0)
-        error_state |= OVMS_DIAG_VFS_WRITE_FERROR;
-      if (fatal || logger->HasStorageError())
-        error_state |= OVMS_DIAG_VFS_WRITE_STORAGE;
-
-      uint32_t primary_queued =
-        logger->m_queue ? uxQueueMessagesWaiting(logger->m_queue) : 0;
-      uint32_t overflow_queued = VfsDiagToUint32(
-        logger->m_overflow_occupancy.load(std::memory_order_relaxed));
-      uint32_t stable;
-      if (VfsDiagTryLock(&ovms_diag_live.vfs_slow_write_sequence, stable))
-        {
-      OvmsDiagStore(&ovms_diag_live.vfs_slow_write_requested,
-        VfsDiagToUint32(requested));
-      OvmsDiagStore(&ovms_diag_live.vfs_slow_write_accepted,
-        VfsDiagToUint32(written));
-      OvmsDiagStore(&ovms_diag_live.vfs_slow_write_file_offset,
-        VfsDiagToUint32(file_offset));
-      OvmsDiagStore(&ovms_diag_live.vfs_slow_write_cluster_offset,
-        VfsDiagToUint32(cluster_offset));
-      OvmsDiagStore(&ovms_diag_live.vfs_slow_write_batch_used,
-        VfsDiagToUint32(batch_used));
-      OvmsDiagStore(&ovms_diag_live.vfs_slow_write_batch_capacity,
-        VfsDiagToUint32(batch_capacity));
-      OvmsDiagStore(&ovms_diag_live.vfs_slow_write_elapsed_us,
-        VfsDiagToUint32(elapsed));
-      OvmsDiagStore(&ovms_diag_live.vfs_slow_write_sync_due_ms,
-        sync_due_ms);
-      OvmsDiagStore(&ovms_diag_live.vfs_slow_write_sync_state, sync_state);
-      OvmsDiagStore(&ovms_diag_live.vfs_slow_write_primary_queued,
-        primary_queued);
-      OvmsDiagStore(&ovms_diag_live.vfs_slow_write_overflow_queued,
-        overflow_queued);
-      OvmsDiagStore(&ovms_diag_live.vfs_slow_write_error_state, error_state);
-      OvmsDiagStore(&ovms_diag_live.vfs_slow_write_errno, write_errno);
-      OvmsDiagStore(&ovms_diag_live.vfs_slow_write_ferror, write_ferror);
-      __atomic_store_n(&ovms_diag_live.vfs_slow_write_sequence, stable + 2,
-        __ATOMIC_RELEASE);
-        }
-      }
 
     if (written > 0)
       {
@@ -637,19 +385,8 @@ bool canlog_vfs_conn::WriteFileBytes(const char* data, size_t length, size_t& ac
 
     if (fatal)
       {
-      bool expected = false;
-      if (m_write_first_recorded.compare_exchange_strong(expected, true,
-            std::memory_order_acq_rel))
-        {
-        m_write_first_requested.store(requested, std::memory_order_relaxed);
-        m_write_first_returned.store(written, std::memory_order_relaxed);
-        m_write_first_errno.store(write_errno, std::memory_order_relaxed);
-        m_write_first_ferror.store(write_ferror, std::memory_order_relaxed);
-        m_write_first_duration_ms.store(static_cast<uint32_t>(elapsed / 1000),
-          std::memory_order_relaxed);
-        static_cast<canlog_vfs*>(m_logger)->EnterStorageError(
-          CANLOG_VFS_STORAGE_ERROR_WRITE);
-        }
+      static_cast<canlog_vfs*>(m_logger)->EnterStorageError(
+        CANLOG_VFS_STORAGE_ERROR_WRITE);
       ESP_LOGE(TAG,
         "Terminal CAN log storage error for '%s': requested=%u returned=%u ferror=%d errno=%d duration=%.3fms",
         m_peer.c_str(), (unsigned)requested, (unsigned)written,
@@ -682,15 +419,11 @@ bool canlog_vfs_conn::FlushBatch()
   if (!m_file || !m_batch_buffer)
     return false;
 
-  uint32_t diag_parent = VfsDiagBegin(OVMS_DIAG_VFS_BATCH_FLUSH);
-  OvmsDiagIncrement(&ovms_diag_live.vfs_batch_start);
   size_t accepted = 0;
   if (WriteFileBytes(m_batch_buffer, batch_used, accepted))
     {
     m_batch_used.store(0);
     UpdateBatchLimit();
-    OvmsDiagIncrement(&ovms_diag_live.vfs_batch_end);
-    VfsDiagEnd(diag_parent);
     return true;
     }
 
@@ -702,8 +435,6 @@ bool canlog_vfs_conn::FlushBatch()
   m_dirty = true;
   ESP_LOGE(TAG, "Error flushing CAN log batch for '%s': retained %u unwritten bytes",
     m_peer.c_str(), (unsigned)remaining);
-  OvmsDiagIncrement(&ovms_diag_live.vfs_batch_end);
-  VfsDiagEnd(diag_parent);
   return false;
   }
 
@@ -714,7 +445,6 @@ bool canlog_vfs_conn::Sync(bool force)
   if (static_cast<canlog_vfs*>(m_logger)->HasStorageError())
     return false;
 
-  m_sync_in_progress.store(true, std::memory_order_release);
   int64_t started = esp_timer_get_time();
   bool batch_result = FlushBatch();
   if (!batch_result)
@@ -728,32 +458,11 @@ bool canlog_vfs_conn::Sync(bool force)
     }
     ESP_LOGE(TAG, "Error syncing CAN log '%s': batch=-1 pending=%u",
       m_peer.c_str(), (unsigned)m_batch_used.load());
-    m_sync_in_progress.store(false, std::memory_order_release);
     return false;
     }
-  uint32_t diag_parent = VfsDiagBegin(OVMS_DIAG_VFS_FFLUSH);
-  OvmsDiagIncrement(&ovms_diag_live.vfs_fflush_start);
-  int64_t fflush_started = esp_timer_get_time();
-  int flush_result = fflush(m_file);
-  uint32_t fflush_elapsed = VfsDiagToUint32(
-    esp_timer_get_time() - fflush_started);
-  OvmsDiagIncrement(&ovms_diag_live.vfs_fflush_end);
-  OvmsDiagStore(&ovms_diag_live.vfs_fflush_last_us, fflush_elapsed);
-  VfsDiagUpdateMax(&ovms_diag_live.vfs_fflush_max_us, fflush_elapsed);
-  OvmsDiagStore(&ovms_diag_live.vfs_fflush_result, flush_result);
-  VfsDiagEnd(diag_parent);
 
-  diag_parent = VfsDiagBegin(OVMS_DIAG_VFS_FSYNC);
-  OvmsDiagIncrement(&ovms_diag_live.vfs_fsync_start);
-  int64_t fsync_started = esp_timer_get_time();
+  int flush_result = fflush(m_file);
   int sync_result = fsync(fileno(m_file));
-  uint32_t fsync_elapsed = VfsDiagToUint32(
-    esp_timer_get_time() - fsync_started);
-  OvmsDiagIncrement(&ovms_diag_live.vfs_fsync_end);
-  OvmsDiagStore(&ovms_diag_live.vfs_fsync_last_us, fsync_elapsed);
-  VfsDiagUpdateMax(&ovms_diag_live.vfs_fsync_max_us, fsync_elapsed);
-  OvmsDiagStore(&ovms_diag_live.vfs_fsync_result, sync_result);
-  VfsDiagEnd(diag_parent);
   int64_t elapsed = esp_timer_get_time() - started;
 
   {
@@ -761,23 +470,20 @@ bool canlog_vfs_conn::Sync(bool force)
   m_sync_time += elapsed;
   m_sync_count++;
 
-  if (!batch_result || flush_result != 0 || sync_result != 0)
+  if (flush_result != 0 || sync_result != 0)
     {
     m_sync_errors++;
     }
   }
 
-  if (!batch_result || flush_result != 0 || sync_result != 0)
+  if (flush_result != 0 || sync_result != 0)
     {
-    ESP_LOGE(TAG, "Error syncing CAN log '%s': batch=%d pending=%u fflush=%d fsync=%d",
-      m_peer.c_str(), batch_result ? 0 : -1, (unsigned)m_batch_used.load(),
-      flush_result, sync_result);
-    m_sync_in_progress.store(false, std::memory_order_release);
+    ESP_LOGE(TAG, "Error syncing CAN log '%s': pending=%u fflush=%d fsync=%d",
+      m_peer.c_str(), (unsigned)m_batch_used.load(), flush_result, sync_result);
     return false;
     }
 
   m_dirty = false;
-  m_sync_in_progress.store(false, std::memory_order_release);
   return true;
   }
 
@@ -816,8 +522,6 @@ bool canlog_vfs_conn::CloseFile()
     heap_caps_free(m_format_buffer);
     m_format_buffer = NULL;
     }
-  m_stdio_buffer_size = 0;
-  m_stdio_buffer_set = false;
   m_batch_capacity = 0;
   m_batch_used.store(0);
   m_format_buffer_size = 0;
@@ -854,16 +558,14 @@ bool canlog_vfs_conn::CloseFileStorageError()
 
 canlog_vfs::canlog_vfs(std::string path, std::string format)
   : canlog("vfs", format, canformat::Discard, false), m_vfs_conn(NULL),
-    m_syncperiod(0), m_batch_capacity_config(0), m_sync_deadline(0),
-    m_diag_lifecycle_sequence(0),
+    m_syncperiod(0), m_batch_capacity_config(0),
     m_storage_error_reason(CANLOG_VFS_STORAGE_ERROR_NONE),
     m_accepting(false), m_producers(0),
     m_queue_size(0), m_primary_highwater(0),
     m_overflow_ring(NULL), m_overflow_scratch(NULL), m_overflow_size(0),
     m_overflow_head(0), m_overflow_tail(0), m_overflow_count(0),
     m_overflow_occupancy(0),
-    m_overflow_highwater(0), m_spill_active(false), m_spill_started(0),
-    m_active_timing(NULL)
+    m_overflow_highwater(0), m_spill_active(false)
   {
   m_path = path;
   LoadConfig();
@@ -877,8 +579,6 @@ canlog_vfs::~canlog_vfs()
   {
   MyEvents.DeregisterEvent(IDTAG);
   Close();
-  VfsDiagCaptureLifecycle(OVMS_DIAG_VFS_LIFECYCLE_DESTRUCTION,
-    m_diag_lifecycle_sequence);
   }
 
 void canlog_vfs::VfsTaskEntry(void* context)
@@ -890,11 +590,7 @@ void canlog_vfs::VfsTask()
   {
   int syncperiod = m_syncperiod.load();
   int64_t sync_deadline = 0;
-  m_sync_deadline = 0;
   m_task_ready.Give();
-  OvmsDiagStore(&ovms_diag_live.vfs_active, 1);
-  OvmsDiagStore(&ovms_diag_live.vfs_op, OVMS_DIAG_VFS_IDLE);
-  VfsDiagSampleHeap();
 
   for (;;)
     {
@@ -906,7 +602,6 @@ void canlog_vfs::VfsTask()
       {
       if (!ProcessQueueItem(item, syncperiod, sync_deadline))
         break;
-      VfsDiagSampleHeap();
       if (HasStorageError())
         {
         HandleStorageError(NULL, 0);
@@ -933,7 +628,6 @@ void canlog_vfs::VfsTask()
           running = false;
           break;
           }
-        VfsDiagSampleHeap();
         if (HasStorageError())
           {
           HandleStorageError(m_overflow_scratch + i + 1, overflow_count - i - 1);
@@ -971,7 +665,6 @@ void canlog_vfs::VfsTask()
       {
       if (!ProcessQueueItem(item, syncperiod, sync_deadline))
         break;
-      VfsDiagSampleHeap();
       if (HasStorageError())
         {
         HandleStorageError(NULL, 0);
@@ -986,9 +679,6 @@ void canlog_vfs::VfsTask()
       }
     }
 
-  OvmsDiagStore(&ovms_diag_live.vfs_active, 0);
-  OvmsDiagStore(&ovms_diag_live.vfs_op, OVMS_DIAG_VFS_IDLE);
-  m_sync_deadline = 0;
   vTaskDelete(NULL);
   }
 
@@ -999,11 +689,6 @@ bool canlog_vfs::ProcessQueueItem(canlog_vfs_queue_msg_t& item,
     {
     case CANLOG_VFS_DATA:
       {
-      OvmsDiagIncrement(&ovms_diag_live.vfs_heartbeat);
-      OvmsDiagIncrement(&ovms_diag_live.vfs_dequeue);
-      int64_t data_started = esp_timer_get_time();
-      canlog_vfs_data_timing_t timing;
-      m_active_timing = &timing;
       CAN_log_message_t& msg = item.data.message;
       if (m_formatter && m_vfs_conn)
         {
@@ -1014,40 +699,24 @@ bool canlog_vfs::ProcessQueueItem(canlog_vfs_queue_msg_t& item,
         if (direct_size > 0
             && m_vfs_conn->GetFormatBuffer(direct_size, format_buffer, in_batch))
           {
-          uint32_t diag_parent = VfsDiagBegin(OVMS_DIAG_VFS_FORMAT);
-          int64_t format_started = esp_timer_get_time();
           size_t result_length = m_formatter->get(&msg, format_buffer, direct_size);
-          OvmsDiagIncrement(&ovms_diag_live.vfs_format_complete);
-          VfsDiagEnd(diag_parent);
-          uint64_t format_elapsed = esp_timer_get_time() - format_started;
-          RecordFormatTiming(timing, format_elapsed, result_length);
           if (result_length > 0)
             m_vfs_conn->OutputMsgDirect(msg, format_buffer, result_length, in_batch);
           }
         else
           {
-          uint32_t diag_parent = VfsDiagBegin(OVMS_DIAG_VFS_FORMAT);
-          int64_t format_started = esp_timer_get_time();
           std::string result = m_formatter->get(&msg);
-          OvmsDiagIncrement(&ovms_diag_live.vfs_format_complete);
-          VfsDiagEnd(diag_parent);
-          uint64_t format_elapsed = esp_timer_get_time() - format_started;
-          RecordFormatTiming(timing, format_elapsed, result.length());
           if (result.length() > 0)
             m_vfs_conn->OutputMsg(msg, result);
           }
 
         if (!was_dirty && m_vfs_conn->m_dirty && syncperiod > 0)
-          {
           sync_deadline = esp_timer_get_time() + (int64_t)syncperiod * 1000000;
-          m_sync_deadline = sync_deadline;
-          }
 
         if (syncperiod == -1 && m_vfs_conn->m_dirty)
           {
           m_vfs_conn->Sync();
           sync_deadline = 0;
-          m_sync_deadline = 0;
           }
         }
       else
@@ -1056,18 +725,13 @@ bool canlog_vfs::ProcessQueueItem(canlog_vfs_queue_msg_t& item,
         }
 
       FreeQueueItem(item);
-      m_active_timing = NULL;
-      RecordDataTiming(data_started, timing);
       break;
       }
 
     case CANLOG_VFS_OPEN:
       *item.data.control.result = OpenFile();
       if (m_vfs_conn && m_vfs_conn->m_dirty && syncperiod > 0)
-        {
         sync_deadline = esp_timer_get_time() + (int64_t)syncperiod * 1000000;
-        m_sync_deadline = sync_deadline;
-        }
       item.data.control.ack->Give();
       break;
 
@@ -1079,18 +743,11 @@ bool canlog_vfs::ProcessQueueItem(canlog_vfs_queue_msg_t& item,
           {
           m_vfs_conn->Sync();
           sync_deadline = 0;
-          m_sync_deadline = 0;
           }
         else if (syncperiod > 0)
-          {
           sync_deadline = esp_timer_get_time() + (int64_t)syncperiod * 1000000;
-          m_sync_deadline = sync_deadline;
-          }
         else
-          {
           sync_deadline = 0;
-          m_sync_deadline = 0;
-          }
         }
       break;
 
@@ -1113,7 +770,6 @@ void canlog_vfs::CheckSyncDeadline(int syncperiod, int64_t& sync_deadline)
     sync_deadline = m_vfs_conn->m_dirty
       ? esp_timer_get_time() + (int64_t)syncperiod * 1000000
       : 0;
-    m_sync_deadline = sync_deadline;
     }
   }
 
@@ -1201,18 +857,10 @@ bool canlog_vfs::StartVfsTask(size_t primary_size, size_t overflow_size)
   m_overflow_occupancy.store(0, std::memory_order_relaxed);
   m_overflow_highwater = 0;
   m_spill_active = false;
-  m_spill_started = 0;
   m_overflow_stats = canlog_vfs_overflow_stats_t();
 
   while (m_task_ready.Take(0)) {}
   while (m_terminal_stop_ack.Take(0)) {}
-  const uint32_t stage_caps = MALLOC_CAP_DMA | MALLOC_CAP_8BIT;
-  OvmsDiagStore(&ovms_diag_live.vfs_queues_ready_free,
-    static_cast<uint32_t>(heap_caps_get_free_size(stage_caps)));
-  OvmsDiagStore(&ovms_diag_live.vfs_queues_ready_largest,
-    static_cast<uint32_t>(heap_caps_get_largest_free_block(stage_caps)));
-  VfsDiagCaptureLifecycle(OVMS_DIAG_VFS_LIFECYCLE_QUEUES_READY,
-    m_diag_lifecycle_sequence);
   BaseType_t result = xTaskCreatePinnedToCore(VfsTaskEntry, "OVMS CanLogVFS", 4096, (void*)this,
     CANLOG_VFS_TASK_PRIORITY, &m_task, CORE(1));
   if (result != pdPASS)
@@ -1293,6 +941,8 @@ bool canlog_vfs::OpenFile()
     return false;
     }
 
+  // Batching is owned by this logger, so leave stdio unbuffered and let every
+  // fwrite go straight through to the cluster-aligned owner batch.
   int setvbuf_result = setvbuf(conn->m_file, NULL, _IONBF, 0);
   if (setvbuf_result != 0)
     {
@@ -1303,36 +953,11 @@ bool canlog_vfs::OpenFile()
     delete conn;
     return false;
     }
-  conn->m_stdio_buffer_size = 0;
-  conn->m_stdio_buffer_set = true;
-  VfsDiagCaptureLifecycle(OVMS_DIAG_VFS_LIFECYCLE_FOPEN_READY,
-    m_diag_lifecycle_sequence);
-
-  const uint32_t owner_caps = MALLOC_CAP_DMA | MALLOC_CAP_8BIT;
-  OvmsDiagIncrement(&ovms_diag_live.vfs_owner_sequence);
-  OvmsDiagStore(&ovms_diag_live.vfs_owner_requested,
-    static_cast<uint32_t>(batch_size));
-  OvmsDiagStore(&ovms_diag_live.vfs_owner_caps, owner_caps);
-  OvmsDiagStore(&ovms_diag_live.vfs_owner_attempt_ms, VfsDiagNowMs());
-  OvmsDiagStore(&ovms_diag_live.vfs_owner_before_free,
-    static_cast<uint32_t>(heap_caps_get_free_size(owner_caps)));
-  OvmsDiagStore(&ovms_diag_live.vfs_owner_before_largest,
-    static_cast<uint32_t>(heap_caps_get_largest_free_block(owner_caps)));
-  __atomic_store_n(&ovms_diag_live.vfs_owner_result,
-    static_cast<uint32_t>(OVMS_DIAG_VFS_OWNER_ATTEMPTING), __ATOMIC_RELEASE);
 
   conn->m_batch_buffer = static_cast<char*>(heap_caps_malloc(batch_size,
-    owner_caps));
-  OvmsDiagStore(&ovms_diag_live.vfs_owner_after_free,
-    static_cast<uint32_t>(heap_caps_get_free_size(owner_caps)));
-  OvmsDiagStore(&ovms_diag_live.vfs_owner_after_largest,
-    static_cast<uint32_t>(heap_caps_get_largest_free_block(owner_caps)));
+    MALLOC_CAP_DMA | MALLOC_CAP_8BIT));
   if (!conn->m_batch_buffer)
     {
-    __atomic_store_n(&ovms_diag_live.vfs_owner_result,
-      static_cast<uint32_t>(OVMS_DIAG_VFS_OWNER_FAILED), __ATOMIC_RELEASE);
-    OvmsDiagRecordAllocationFailure(OVMS_DIAG_ALLOC_VFS_OWNER_BATCH,
-      batch_size);
     ESP_LOGE(TAG, "Error: Can't allocate %u byte owner batch for '%s'",
       (unsigned)batch_size, m_path.c_str());
     fclose(conn->m_file);
@@ -1340,13 +965,9 @@ bool canlog_vfs::OpenFile()
     delete conn;
     return false;
     }
-  __atomic_store_n(&ovms_diag_live.vfs_owner_result,
-    static_cast<uint32_t>(OVMS_DIAG_VFS_OWNER_SUCCESS), __ATOMIC_RELEASE);
   conn->m_batch_capacity = batch_size;
   conn->m_batch_limit.store(batch_size);
   conn->m_batch_used.store(0);
-  VfsDiagCaptureLifecycle(OVMS_DIAG_VFS_LIFECYCLE_OWNER_READY,
-    m_diag_lifecycle_sequence);
 
   size_t direct_size = m_formatter->getbuffersize();
   if (direct_size > 0)
@@ -1441,7 +1062,6 @@ void canlog_vfs::BeginSpillLocked()
     return;
 
   m_spill_active = true;
-  m_spill_started = esp_timer_get_time();
   m_overflow_stats.transitions++;
   }
 
@@ -1465,8 +1085,6 @@ bool canlog_vfs::RouteQueueItem(const canlog_vfs_queue_msg_t& item, bool is_data
     {
     if (xQueueSend(m_queue, &item, 0) == pdTRUE)
       {
-      if (is_data)
-        OvmsDiagIncrement(&ovms_diag_live.vfs_primary_enqueue);
       uint32_t waiting = uxQueueMessagesWaiting(m_queue);
       uint32_t highwater = m_primary_highwater.load(std::memory_order_relaxed);
       while (waiting > highwater
@@ -1483,7 +1101,6 @@ bool canlog_vfs::RouteQueueItem(const canlog_vfs_queue_msg_t& item, bool is_data
       {
       m_dropcount++;
       m_overflow_stats.drops++;
-      OvmsDiagIncrement(&ovms_diag_live.vfs_overflow_drop);
       }
     return false;
     }
@@ -1495,8 +1112,6 @@ bool canlog_vfs::RouteQueueItem(const canlog_vfs_queue_msg_t& item, bool is_data
   if (m_overflow_count > m_overflow_highwater)
     m_overflow_highwater = m_overflow_count;
   m_overflow_stats.entries++;
-  if (is_data)
-    OvmsDiagIncrement(&ovms_diag_live.vfs_overflow_enqueue);
   return true;
   }
 
@@ -1508,7 +1123,6 @@ bool canlog_vfs::EnterStorageError(canlog_vfs_storage_error_t reason)
     return false;
 
   m_accepting.store(false, std::memory_order_release);
-  OvmsDiagStore(&ovms_diag_live.vfs_storage_error, static_cast<uint32_t>(reason));
   return true;
   }
 
@@ -1571,16 +1185,9 @@ void canlog_vfs::HandleStorageError(canlog_vfs_queue_msg_t* pending,
     m_overflow_occupancy.store(m_overflow_count, std::memory_order_relaxed);
     ReleaseStorageErrorItem(item, close_ack);
     }
-  if (m_spill_active && m_spill_started > 0)
-    {
-    uint64_t active_elapsed = esp_timer_get_time() - m_spill_started;
-    m_overflow_stats.active_time += active_elapsed;
-    UpdateTimingMax(m_overflow_stats.active_max, active_elapsed);
-    }
   m_overflow_head = 0;
   m_overflow_tail = 0;
   m_spill_active = false;
-  m_spill_started = 0;
   }
 
   if (m_vfs_conn)
@@ -1617,10 +1224,8 @@ size_t canlog_vfs::CopyOverflowBatch(canlog_vfs_queue_msg_t* destination, size_t
   copied = std::min(copied, m_overflow_size - head);
   }
 
-  int64_t copy_started = esp_timer_get_time();
   memcpy(destination, m_overflow_ring + head,
     copied * sizeof(canlog_vfs_queue_msg_t));
-  uint64_t copy_elapsed = esp_timer_get_time() - copy_started;
 
   {
   OvmsMutexLock route(&m_route_mutex);
@@ -1636,87 +1241,12 @@ size_t canlog_vfs::CopyOverflowBatch(canlog_vfs_queue_msg_t* destination, size_t
   m_overflow_count -= copied;
   m_overflow_occupancy.store(m_overflow_count, std::memory_order_relaxed);
   m_overflow_stats.drain_batches++;
-  m_overflow_stats.copy_time += copy_elapsed;
-  UpdateTimingMax(m_overflow_stats.copy_max, copy_elapsed);
 
   if (m_overflow_count == 0)
-    {
-    int64_t now = esp_timer_get_time();
-    uint64_t active_elapsed = now - m_spill_started;
-    m_overflow_stats.active_time += active_elapsed;
-    UpdateTimingMax(m_overflow_stats.active_max, active_elapsed);
     m_spill_active = false;
-    m_spill_started = 0;
-    }
   }
 
   return copied;
-  }
-
-void canlog_vfs::UpdateTimingMax(uint64_t& maximum, uint64_t elapsed)
-  {
-  if (maximum < elapsed)
-    maximum = elapsed;
-  }
-
-void canlog_vfs::RecordDataTiming(int64_t started, const canlog_vfs_data_timing_t& timing)
-  {
-  OvmsMutexLock lock(&m_timing_mutex);
-  m_timing.format_calls += timing.format_calls;
-  m_timing.format_time += timing.format_time;
-  UpdateTimingMax(m_timing.format_max, timing.format_max);
-  m_timing.format_bytes += timing.format_bytes;
-  m_timing.write_calls += timing.write_calls;
-  m_timing.write_time += timing.write_time;
-  UpdateTimingMax(m_timing.write_max, timing.write_max);
-  m_timing.write_bytes += timing.write_bytes;
-  m_timing.write_slow_1ms += timing.write_slow_1ms;
-  m_timing.write_slow_5ms += timing.write_slow_5ms;
-  m_timing.write_slow_10ms += timing.write_slow_10ms;
-
-  uint64_t elapsed = esp_timer_get_time() - started;
-  m_timing.data_calls++;
-  m_timing.data_time += elapsed;
-  UpdateTimingMax(m_timing.data_max, elapsed);
-  }
-
-void canlog_vfs::RecordFormatTiming(canlog_vfs_data_timing_t& timing, uint64_t elapsed, size_t bytes)
-  {
-  timing.format_calls++;
-  timing.format_time += elapsed;
-  UpdateTimingMax(timing.format_max, elapsed);
-  if (bytes > 0)
-    timing.format_bytes += bytes;
-  }
-
-void canlog_vfs::RecordWriteTiming(uint64_t elapsed, size_t bytes)
-  {
-  if (m_active_timing)
-    {
-    m_active_timing->write_calls++;
-    m_active_timing->write_time += elapsed;
-    UpdateTimingMax(m_active_timing->write_max, elapsed);
-    m_active_timing->write_bytes += bytes;
-    if (elapsed >= 1000)
-      m_active_timing->write_slow_1ms++;
-    if (elapsed >= 5000)
-      m_active_timing->write_slow_5ms++;
-    if (elapsed >= 10000)
-      m_active_timing->write_slow_10ms++;
-    return;
-    }
-
-  OvmsMutexLock lock(&m_timing_mutex);
-  m_timing.write_calls++;
-  m_timing.write_time += elapsed;
-  UpdateTimingMax(m_timing.write_max, elapsed);
-  m_timing.write_bytes += bytes;
-  if (elapsed >= 1000)
-    m_timing.write_slow_1ms++;
-  if (elapsed >= 5000)
-    m_timing.write_slow_5ms++;
-  if (elapsed >= 10000)
-    m_timing.write_slow_10ms++;
   }
 
 void canlog_vfs::FreeQueueItem(canlog_vfs_queue_msg_t& item)
@@ -1759,7 +1289,6 @@ void canlog_vfs::DrainQueue()
   m_overflow_head = 0;
   m_overflow_tail = 0;
   m_spill_active = false;
-  m_spill_started = 0;
   }
 
 void canlog_vfs::DestroyVfsQueue()
@@ -1788,7 +1317,6 @@ void canlog_vfs::DestroyVfsQueue()
   m_overflow_occupancy.store(0, std::memory_order_relaxed);
   m_overflow_highwater = 0;
   m_spill_active = false;
-  m_spill_started = 0;
   }
 
 bool canlog_vfs::Open()
@@ -1818,11 +1346,6 @@ bool canlog_vfs::Open()
   if (m_queue || m_task || m_vfs_conn)
     CloseLocked();
 
-  VfsDiagReset();
-  m_diag_lifecycle_sequence =
-    OvmsDiagIncrement(&ovms_diag_live.vfs_lifecycle_sequence);
-  VfsDiagCaptureLifecycle(OVMS_DIAG_VFS_LIFECYCLE_OPEN_BASELINE,
-    m_diag_lifecycle_sequence);
   m_storage_error_reason.store(CANLOG_VFS_STORAGE_ERROR_NONE,
     std::memory_order_release);
 
@@ -1849,13 +1372,6 @@ bool canlog_vfs::Open()
   item.command = CANLOG_VFS_OPEN;
   item.data.control.ack = &ack;
   item.data.control.result = &opened;
-  const uint32_t stage_caps = MALLOC_CAP_DMA | MALLOC_CAP_8BIT;
-  OvmsDiagStore(&ovms_diag_live.vfs_task_ready_free,
-    static_cast<uint32_t>(heap_caps_get_free_size(stage_caps)));
-  OvmsDiagStore(&ovms_diag_live.vfs_task_ready_largest,
-    static_cast<uint32_t>(heap_caps_get_largest_free_block(stage_caps)));
-  VfsDiagCaptureLifecycle(OVMS_DIAG_VFS_LIFECYCLE_TASK_READY,
-    m_diag_lifecycle_sequence);
   if (!QueueControl(item))
     {
     StopVfsTask();
@@ -1875,8 +1391,6 @@ bool canlog_vfs::Open()
 
   m_isopen = true;
   m_accepting.store(true, std::memory_order_release);
-  VfsDiagCaptureLifecycle(OVMS_DIAG_VFS_LIFECYCLE_FULLY_OPEN,
-    m_diag_lifecycle_sequence);
   ESP_LOGI(TAG, "Now logging CAN messages to '%s'", m_path.c_str());
   return true;
   }
@@ -1889,10 +1403,6 @@ void canlog_vfs::Close()
 
 void canlog_vfs::CloseLocked()
   {
-  bool had_resources = m_queue || m_task || m_vfs_conn;
-  if (had_resources)
-    VfsDiagCaptureLifecycle(OVMS_DIAG_VFS_LIFECYCLE_PRE_CLOSE,
-      m_diag_lifecycle_sequence);
   m_accepting.store(false, std::memory_order_release);
   m_isopen = false;
 
@@ -1911,17 +1421,10 @@ void canlog_vfs::CloseLocked()
   m_connmap.clear();
   m_vfs_conn = NULL;
   }
-  if (had_resources)
-    VfsDiagCaptureLifecycle(OVMS_DIAG_VFS_LIFECYCLE_POST_CLOSE_FREE,
-      m_diag_lifecycle_sequence);
 
   DrainQueue();
   DestroyVfsQueue();
   m_task = NULL;
-  m_sync_deadline = 0;
-  if (had_resources)
-    VfsDiagCaptureLifecycle(OVMS_DIAG_VFS_LIFECYCLE_POST_STOP,
-      m_diag_lifecycle_sequence);
   }
 
 void canlog_vfs::LogFrame(canbus* bus, CAN_log_type_t type, const CAN_frame_t* frame)
@@ -2041,13 +1544,11 @@ std::string canlog_vfs::GetStats()
   result.append(bufsize);
   result.append(" ");
 
-  std::ostringstream stats;
   uint32_t primary_queued = 0;
   size_t overflow_queued = 0;
   size_t overflow_highwater = 0;
   size_t overflow_size = 0;
   bool spill_active = false;
-  int64_t spill_started = 0;
   canlog_vfs_overflow_stats_t overflow_stats;
   {
   OvmsMutexLock route(&m_route_mutex);
@@ -2056,16 +1557,10 @@ std::string canlog_vfs::GetStats()
   overflow_highwater = m_overflow_highwater;
   overflow_size = m_overflow_size;
   spill_active = m_spill_active;
-  spill_started = m_spill_started;
   overflow_stats = m_overflow_stats;
   }
-  if (spill_active && spill_started > 0)
-    {
-    uint64_t active_elapsed = esp_timer_get_time() - spill_started;
-    overflow_stats.active_time += active_elapsed;
-    UpdateTimingMax(overflow_stats.active_max, active_elapsed);
-    }
 
+  std::ostringstream stats;
   float droprate = (m_msgcount > 0) ? ((float)m_dropcount / m_msgcount * 100) : 0;
   stats << "Messages:" << m_msgcount
     << " Dropped:" << m_dropcount
@@ -2074,39 +1569,23 @@ std::string canlog_vfs::GetStats()
     << " PrimarySize:" << m_queue_size
     << " PrimaryQueued:" << primary_queued
     << " PrimaryHighWater:" << m_primary_highwater.load()
-    << " PrimaryStorage:" << (m_queue && esp_ptr_internal(m_queue) ? "internal" : "none")
     << " OverflowSize:" << overflow_size
     << " OverflowQueued:" << overflow_queued
     << " OverflowHighWater:" << overflow_highwater
-    << " OverflowStorage:" << (m_overflow_ring && esp_ptr_external_ram(m_overflow_ring) ? "spiram" : "none")
     << " SpillActive:" << (spill_active ? 1 : 0)
     << " StorageError:" << (HasStorageError() ? 1 : 0)
-    << " StorageErrorReason:" << m_storage_error_reason.load(std::memory_order_acquire)
-    << " VfsBuffer:" << (m_vfs_conn ? m_vfs_conn->m_stdio_buffer_size : 0)
-    << " BufferSet:" << (m_vfs_conn && m_vfs_conn->m_stdio_buffer_set ? 1 : 0)
-    << " StdioMode:unbuffered"
-    << " BatchConfigured:" << m_batch_capacity_config.load()
     << " BatchSize:" << (m_vfs_conn ? m_vfs_conn->m_batch_capacity : 0)
     << " BatchLimit:" << (m_vfs_conn ? m_vfs_conn->m_batch_limit.load() : 0)
     << " ClusterAlign:" << (m_vfs_conn ? m_vfs_conn->m_cluster_size : 0)
-    << " BatchUsed:" << (m_vfs_conn ? m_vfs_conn->m_batch_used.load() : 0)
-    << " DirectFormat:" << (m_vfs_conn && m_vfs_conn->m_format_buffer ? 1 : 0);
-  result.append(stats.str());
-
-  std::ostringstream overflowstats;
-  overflowstats << "\n  OverflowEntries:" << overflow_stats.entries
+    << " DirectFormat:" << (m_vfs_conn && m_vfs_conn->m_format_buffer ? 1 : 0)
+    << "\n  OverflowEntries:" << overflow_stats.entries
     << " OverflowDrops:" << overflow_stats.drops
     << " OverflowTransitions:" << overflow_stats.transitions
     << " OverflowDrainBatches:" << overflow_stats.drain_batches
-    << " OverflowCopyTime:" << std::fixed << std::setprecision(3)
-    << (double)overflow_stats.copy_time / 1000000.0 << "s"
-    << " OverflowCopyMax:" << std::fixed << std::setprecision(3)
-    << (double)overflow_stats.copy_max / 1000.0 << "ms"
-    << "\n  OverflowActiveTime:" << std::fixed << std::setprecision(3)
-    << (double)overflow_stats.active_time / 1000000.0 << "s"
-    << " OverflowActiveMax:" << std::fixed << std::setprecision(3)
-    << (double)overflow_stats.active_max / 1000.0 << "ms";
-  result.append(overflowstats.str());
+    << " WriteErrors:" << (m_vfs_conn ? m_vfs_conn->m_write_errors.load() : 0)
+    << " WriteShort:" << (m_vfs_conn ? m_vfs_conn->m_write_short.load() : 0)
+    << " WriteZero:" << (m_vfs_conn ? m_vfs_conn->m_write_zero.load() : 0);
+  result.append(stats.str());
 
   char syncstats[96];
   if (m_vfs_conn)
@@ -2121,99 +1600,6 @@ std::string canlog_vfs::GetStats()
     snprintf(syncstats, sizeof(syncstats), " SyncPeriod:%ds Syncs:0 SyncErrors:0 SyncTime:0.000s",
       m_syncperiod.load());
   result.append(syncstats);
-
-  canlog_vfs_timing_stats_t timing;
-  {
-  OvmsMutexLock timing_lock(&m_timing_mutex);
-  timing = m_timing;
-  }
-
-  std::ostringstream timingstats;
-  timingstats << "\n  DataCalls:" << timing.data_calls
-    << " DataTime:" << std::fixed << std::setprecision(3)
-    << (double)timing.data_time / 1000000.0 << "s"
-    << " DataMax:" << std::fixed << std::setprecision(3)
-    << (double)timing.data_max / 1000.0 << "ms"
-    << "\n  FormatCalls:" << timing.format_calls
-    << " FormatTime:" << std::fixed << std::setprecision(3)
-    << (double)timing.format_time / 1000000.0 << "s"
-    << " FormatMax:" << std::fixed << std::setprecision(3)
-    << (double)timing.format_max / 1000.0 << "ms"
-    << " FormatBytes:" << timing.format_bytes
-    << "\n  WriteCalls:" << timing.write_calls
-    << " WriteTime:" << std::fixed << std::setprecision(3)
-    << (double)timing.write_time / 1000000.0 << "s"
-    << " WriteMax:" << std::fixed << std::setprecision(3)
-    << (double)timing.write_max / 1000.0 << "ms"
-    << " WriteBytes:" << timing.write_bytes
-    << " WriteSlow1ms:" << timing.write_slow_1ms
-    << " WriteSlow5ms:" << timing.write_slow_5ms
-    << " WriteSlow10ms:" << timing.write_slow_10ms;
-  result.append(timingstats.str());
-
-  bool write_in_progress = m_vfs_conn
-    && m_vfs_conn->m_write_in_progress.load(std::memory_order_acquire);
-  uint32_t write_in_progress_ms = 0;
-  size_t write_current_requested = 0;
-  if (write_in_progress)
-    {
-    uint32_t started_ms = m_vfs_conn->m_write_in_progress_started_ms.load(
-      std::memory_order_relaxed);
-    uint32_t now_ms = static_cast<uint32_t>(esp_timer_get_time() / 1000);
-    write_in_progress_ms = now_ms - started_ms;
-    write_current_requested = m_vfs_conn->m_write_current_requested.load(
-      std::memory_order_relaxed);
-    }
-
-  std::ostringstream writestats;
-  writestats << "\n  WriteErrors:"
-    << (m_vfs_conn ? m_vfs_conn->m_write_errors.load() : 0)
-    << " WriteShort:" << (m_vfs_conn ? m_vfs_conn->m_write_short.load() : 0)
-    << " WriteZero:" << (m_vfs_conn ? m_vfs_conn->m_write_zero.load() : 0)
-    << " WriteFirstErrno:" << (m_vfs_conn ? m_vfs_conn->m_write_first_errno.load() : 0)
-    << " WriteFirstFerror:" << (m_vfs_conn ? m_vfs_conn->m_write_first_ferror.load() : 0)
-    << " WriteFirstRequested:" << (m_vfs_conn ? m_vfs_conn->m_write_first_requested.load() : 0)
-    << " WriteFirstReturned:" << (m_vfs_conn ? m_vfs_conn->m_write_first_returned.load() : 0)
-    << " WriteFirstDurationMs:" << (m_vfs_conn ? m_vfs_conn->m_write_first_duration_ms.load() : 0)
-    << " WriteInProgress:" << (write_in_progress ? 1 : 0)
-    << " WriteInProgressMs:" << write_in_progress_ms
-    << " WriteCurrentRequested:" << write_current_requested;
-  result.append(writestats.str());
-
-  std::ostringstream diagstats;
-  diagstats << "\n  SlowWriteThresholdUs:"
-    << OvmsDiagLoad(&ovms_diag_live.vfs_slow_write_threshold_us)
-    << " SlowWriteSequence:"
-    << OvmsDiagLoad(&ovms_diag_live.vfs_slow_write_sequence)
-    << " SlowWriteRequested:"
-    << OvmsDiagLoad(&ovms_diag_live.vfs_slow_write_requested)
-    << " SlowWriteAccepted:"
-    << OvmsDiagLoad(&ovms_diag_live.vfs_slow_write_accepted)
-    << " SlowWriteOffset:"
-    << OvmsDiagLoad(&ovms_diag_live.vfs_slow_write_file_offset)
-    << " SlowWriteClusterOffset:"
-    << OvmsDiagLoad(&ovms_diag_live.vfs_slow_write_cluster_offset)
-    << " SlowWriteBatch:"
-    << OvmsDiagLoad(&ovms_diag_live.vfs_slow_write_batch_used) << "/"
-    << OvmsDiagLoad(&ovms_diag_live.vfs_slow_write_batch_capacity)
-    << " SlowWriteElapsedUs:"
-    << OvmsDiagLoad(&ovms_diag_live.vfs_slow_write_elapsed_us)
-    << " SlowWriteSyncDueMs:"
-    << OvmsDiagLoad(&ovms_diag_live.vfs_slow_write_sync_due_ms)
-    << " SlowWriteSyncState:"
-    << OvmsDiagLoad(&ovms_diag_live.vfs_slow_write_sync_state)
-    << " SlowWriteQueues:"
-    << OvmsDiagLoad(&ovms_diag_live.vfs_slow_write_primary_queued) << "/"
-    << OvmsDiagLoad(&ovms_diag_live.vfs_slow_write_overflow_queued)
-    << " SlowWriteError:"
-    << OvmsDiagLoad(&ovms_diag_live.vfs_slow_write_error_state)
-    << "\n  FFlushLastUs:" << OvmsDiagLoad(&ovms_diag_live.vfs_fflush_last_us)
-    << " FFlushMaxUs:" << OvmsDiagLoad(&ovms_diag_live.vfs_fflush_max_us)
-    << " FFlushResult:" << OvmsDiagLoad(&ovms_diag_live.vfs_fflush_result)
-    << " FSyncLastUs:" << OvmsDiagLoad(&ovms_diag_live.vfs_fsync_last_us)
-    << " FSyncMaxUs:" << OvmsDiagLoad(&ovms_diag_live.vfs_fsync_max_us)
-    << " FSyncResult:" << OvmsDiagLoad(&ovms_diag_live.vfs_fsync_result);
-  result.append(diagstats.str());
 
   return result;
   }
